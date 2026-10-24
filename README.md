@@ -4,8 +4,9 @@ A background-job system built to make failure behaviour explicit: an HTTP API sa
 PostgreSQL, a dispatcher publishes them to RabbitMQ, and separate workers run them with bounded
 retries, so slow work stays out of the request path and every failure is recorded.
 
-> **Status: early development (phase 1 of 10).** Nothing is runnable yet. Everything below,
-> including scope and limitations, describes the planned design, not working code.
+> **Status: early development (phase 1 of 10).** Only the development checks run so far (see
+> Development setup). Everything else below, including scope and limitations, describes the
+> planned design, not working code.
 
 ## Planned architecture
 
@@ -84,6 +85,18 @@ The ADRs refer to these phases by number.
   effect can happen twice, so handlers with side effects must be idempotent (ADR 0001).
 - Recovering a crashed worker's job takes up to the lease duration plus the recovery interval.
 
-## Setup
+## Development setup
 
-Planned. Commands will be added once the project skeleton exists.
+Requires [uv](https://docs.astral.sh/uv/) and GNU Make. uv installs the pinned Python (3.12, see
+`.python-version`) if it is missing.
+
+```bash
+make install                  # create .venv and install locked dependencies
+uv run pre-commit install     # run lint, format, mypy and secret checks on every commit
+make check                    # lint, format check, mypy --strict, unit tests
+make format                   # apply ruff formatting and safe lint fixes
+```
+
+CI runs `make check` on Python 3.12 and 3.14 and scans the full git history for secrets with
+gitleaks. There is nothing to run yet beyond the checks; services, migrations and the API arrive
+in phase 2.
