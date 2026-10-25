@@ -11,14 +11,13 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from task_platform.config import Settings
 from task_platform.data.db import create_db_engine
-from tests.integration.database import TestDatabaseError, load_test_database_url
+from tests.integration.database import (
+    TestDatabaseError,
+    load_test_database_url,
+    make_test_settings,
+)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-
-
-def make_test_settings(url: str, **overrides: object) -> Settings:
-    # _env_file=None: a developer's .env must not change what the tests measure.
-    return Settings(_env_file=None, database_url=url, **overrides)  # type: ignore[arg-type]
 
 
 def alembic_config(settings: Settings) -> Config:

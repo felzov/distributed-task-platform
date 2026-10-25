@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from task_platform.data.db import create_db_engine
 from task_platform.domain.job_status import JobStatus
-from tests.integration.conftest import make_test_settings
+from tests.integration.database import make_test_settings
 
 pytestmark = pytest.mark.integration
 
@@ -108,9 +108,23 @@ async def test_constraint_violations_are_rejected(
         await insert_job(engine, **overrides)
 
 
-@pytest.mark.parametrize("column", ["type", "payload_version", "payload", "max_attempts"])
+@pytest.mark.parametrize(
+    "column",
+    [
+        "type",
+        "payload_version",
+        "payload",
+        "max_attempts",
+        # A CHECK passes when its expression is NULL, so only NOT NULL stops these.
+        "status",
+        "attempts",
+        "available_at",
+        "created_at",
+        "updated_at",
+    ],
+)
 async def test_required_columns_reject_null(engine: AsyncEngine, column: str) -> None:
-    with pytest.raises(IntegrityError, match="not-null"):
+    with pytest.raises(IntegrityError, match=f'column "{column}" .* violates not-null'):
         await insert_job(engine, **{column: None})
 
 
