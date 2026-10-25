@@ -1,0 +1,29 @@
+# Local services for development and integration tests. Values come from .env (see .env.example).
+services:
+  postgres:
+    # Same image and digest as the CI service container.
+    image: postgres:18.6-alpine@sha256:898c60cb390d1085bc97bdd6a1ae968757421df394b071848b52b1c09c89d6a5
+    environment:
+      POSTGRES_USER: task_platform
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example)}
+      POSTGRES_DB: task_platform
+    ports:
+      # Reachable only from this machine.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # Since PostgreSQL 18 the image keeps its data under /var/lib/postgresql/<major>/docker.
+      - postgres-data:/var/lib/postgresql
+      # Runs only when the volume is empty: creates the task_platform_test database.
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Over TCP on purpose: during first-time init the image runs a temporary server that listens
+      # only on the Unix socket, so a socket check would report healthy before init has finished.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U task_platform -d task_platform"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      # Failed checks during first-time init do not count towards `retries`.
+      start_period: 30s
+
+volumes:
+  postgres-data:
