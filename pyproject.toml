@@ -7,13 +7,16 @@ requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.20.1",
     "asyncpg>=0.32.0",
+    "fastapi>=0.162.0",
     "pydantic>=2.14.1",
     "pydantic-settings>=2.16.1",
     "sqlalchemy[asyncio]>=2.1.6",
+    "uvicorn>=0.54.0",
 ]
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28.1",
     "mypy>=2.4.0",
     "pre-commit>=4.7.0",
     "pytest>=9.1.1",
@@ -67,4 +70,6 @@ asyncio_default_test_loop_scope = "function"
 filterwarnings = [
     "error::DeprecationWarning",
     "error::PendingDeprecationWarning",
+    # SQLAlchemy reports mapping mistakes (e.g. a primary key nothing fills in) only as warnings.
+    "error::sqlalchemy.exc.SAWarning",
 ]

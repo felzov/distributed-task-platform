@@ -5,9 +5,9 @@ PostgreSQL, a dispatcher publishes them to RabbitMQ, and separate workers run th
 retries, so slow work stays out of the request path and every failure is recorded.
 
 > **Status: early development (phase 2 of 10).** So far there are the domain rules, a local
-> PostgreSQL with the `jobs` table migration, and the development checks (see Development setup).
-> Everything else below, including scope and limitations, describes the planned design, not
-> working code.
+> PostgreSQL with the `jobs` table migration, `POST /jobs` (validates and saves a job), and the
+> development checks (see Development setup). Everything else below, including scope and
+> limitations, describes the planned design, not working code.
 
 ## Planned architecture
 
@@ -97,6 +97,7 @@ uv run pre-commit install     # run lint, format, mypy and secret checks on ever
 cp .env.example .env          # then replace every change-me with a local password
 make db-up                    # start PostgreSQL on 127.0.0.1:5432 and wait until it is healthy
 make db-migrate               # apply migrations to the development database
+make run                      # start the API on 127.0.0.1:8000 (docs at /docs)
 make check                    # lint, format check, mypy --strict, unit tests
 make test-integration         # tests against the task_platform_test database
 make check-all                # both of the above

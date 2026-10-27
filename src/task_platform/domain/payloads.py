@@ -87,19 +87,24 @@ def parse_payload(job_type: str, version: int, payload: object, *, max_bytes: in
     try:
         return model.model_validate(payload)
     except ValidationError as exc:
-        details = _safe_details(exc)
+        details = safe_error_details(exc)
     raise InvalidPayloadError(details)
 
 
-def _safe_details(exc: ValidationError) -> tuple[str, ...]:
+def safe_error_details(exc: ValidationError, *, root: str = "payload") -> tuple[str, ...]:
+    """Describe validation errors as "<field>: <error type>" without any input value or key.
+
+    Only for flat models: payload models and the API's request envelope. `root` names the
+    validated value itself, for errors without a field location.
+    """
     details = []
     for error in exc.errors(include_url=False, include_input=False):
         if error["type"] in {"extra_forbidden", "invalid_key"}:
             # The location is the client's own key, which is input too.
             details.append("unexpected field")
         else:
-            # Payload models are flat, so every other location is a schema field name (or empty
-            # when the payload itself has the wrong type). Revisit if a model gains dict fields.
-            location = ".".join(str(part) for part in error["loc"]) or "payload"
+            # The models are flat, so every other location is a schema field name (or empty
+            # when the value itself has the wrong type). Revisit if a model gains dict fields.
+            location = ".".join(str(part) for part in error["loc"]) or root
             details.append(f"{location}: {error['type']}")
     return tuple(details)

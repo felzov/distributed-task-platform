@@ -3,7 +3,9 @@
 All limits and timeouts are explicit here. The defaults are placeholders, not measured values.
 """
 
-from pydantic import Field, SecretStr
+from typing import Self
+
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,3 +23,18 @@ class Settings(BaseSettings):
     db_pool_size: int = Field(default=5, ge=1)
     # How long a request waits for a free pooled connection.
     db_pool_timeout_s: float = Field(default=5.0, gt=0)
+
+    # Size of the job payload as compact UTF-8 JSON (domain `payload_size_bytes`).
+    max_payload_bytes: int = Field(default=64 * 1024, gt=0)
+    # Raw request body, read before any parsing. About twice the payload limit, because the
+    # payload is measured compact while clients may send pretty-printed JSON.
+    max_request_body_bytes: int = Field(default=128 * 1024, gt=0)
+    # Attempt budget of every new job. The bounds match ck_jobs_max_attempts_range.
+    default_max_attempts: int = Field(default=5, ge=1, le=20)
+
+    @model_validator(mode="after")
+    def _body_limit_fits_payload_limit(self) -> Self:
+        # Otherwise a payload under its own limit could never reach the payload check.
+        if self.max_request_body_bytes < self.max_payload_bytes:
+            raise ValueError("max_request_body_bytes must be at least max_payload_bytes")
+        return self

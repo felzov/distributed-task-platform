@@ -57,9 +57,38 @@ def test_validation_errors_do_not_echo_env_file_values(
 
 @pytest.mark.parametrize(
     "field",
-    ["db_connect_timeout_s", "db_statement_timeout_ms", "db_pool_size", "db_pool_timeout_s"],
+    [
+        "db_connect_timeout_s",
+        "db_statement_timeout_ms",
+        "db_pool_size",
+        "db_pool_timeout_s",
+        "max_payload_bytes",
+        "max_request_body_bytes",
+        "default_max_attempts",
+    ],
 )
 @pytest.mark.parametrize("value", [0, -1])
 def test_non_positive_limits_are_rejected(field: str, value: int) -> None:
     with pytest.raises(ValidationError, match=field):
         settings(database_url=URL, **{field: value})
+
+
+@pytest.mark.parametrize(("value", "accepted"), [(1, True), (20, True), (21, False)])
+def test_default_max_attempts_stays_within_the_database_check(value: int, accepted: bool) -> None:
+    # Same bounds as ck_jobs_max_attempts_range: a config typo must fail at startup, not on
+    # every INSERT.
+    if accepted:
+        assert settings(database_url=URL, default_max_attempts=value).default_max_attempts == value
+    else:
+        with pytest.raises(ValidationError, match="default_max_attempts"):
+            settings(database_url=URL, default_max_attempts=value)
+
+
+def test_body_limit_below_payload_limit_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="max_request_body_bytes must be at least"):
+        settings(database_url=URL, max_payload_bytes=2_000, max_request_body_bytes=1_999)
+
+
+def test_body_limit_equal_to_payload_limit_is_accepted() -> None:
+    result = settings(database_url=URL, max_payload_bytes=2_000, max_request_body_bytes=2_000)
+    assert result.max_request_body_bytes == result.max_payload_bytes
