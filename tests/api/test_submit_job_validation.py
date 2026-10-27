@@ -5,6 +5,7 @@ different error: every expected 4xx also shows that validation ran first.
 """
 
 import json
+import traceback
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -14,12 +15,12 @@ from starlette.requests import Request
 from starlette.types import Message
 
 from task_platform.api.errors import ApiError, ApiErrorCode
-from task_platform.api.jobs import read_capped_body
+from task_platform.api.jobs import parse_envelope, read_capped_body
 from task_platform.config import Settings
+from task_platform.main import create_app
 from tests.app_client import app_client
-from tests.settings import make_test_settings
+from tests.settings import UNREACHABLE_DATABASE_URL, make_test_settings
 
-UNREACHABLE_DATABASE_URL = "postgresql+asyncpg://task_platform:unused@127.0.0.1:1/unused_test"
 SENTINEL = "s3cr3t-sentinel-7731"
 
 
@@ -40,7 +41,7 @@ def encode(body: object) -> bytes:
 
 
 async def post(content: bytes, **overrides: object) -> httpx.Response:
-    async with app_client(settings(**overrides)) as client:
+    async with app_client(create_app(settings(**overrides))) as client:
         return await client.post(
             "/jobs", content=content, headers={"content-type": "application/json"}
         )
@@ -121,6 +122,24 @@ async def test_invalid_requests_are_rejected_without_echoing_input(
     assert assert_error(response, status_code, code) == details
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(f'{{"type": "{SENTINEL}"'.encode(), id="malformed JSON"),
+        pytest.param(encode(envelope(**{SENTINEL: SENTINEL})), id="extra field"),
+        pytest.param(encode(envelope(payload_version=SENTINEL)), id="wrong type"),
+    ],
+)
+def test_envelope_error_carries_no_chained_input(content: bytes) -> None:
+    with pytest.raises(ApiError) as exc_info:
+        parse_envelope(content)
+    error = exc_info.value
+    # What a logger would print, chained exceptions included: the ValidationError holds the input.
+    assert SENTINEL not in "".join(traceback.format_exception(error))
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
 @pytest.mark.parametrize("version", [True, 1.0, "1"], ids=["bool", "float", "string"])
 async def test_version_must_be_a_json_integer(version: object) -> None:
     # Each of these would select version 1 under lax validation (True == 1 == 1.0).
@@ -190,7 +209,7 @@ async def test_body_over_limit_is_rejected_without_content_length() -> None:
         for _ in range(3):
             yield b" " * 1_000
 
-    async with app_client(settings(**LIMITS)) as client:
+    async with app_client(create_app(settings(**LIMITS))) as client:
         request = client.build_request("POST", "/jobs", content=chunks())
         # A streamed body is sent chunked, so only the counted read can catch it.
         assert "content-length" not in request.headers

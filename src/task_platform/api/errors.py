@@ -1,9 +1,11 @@
 """The error envelope, API-level error codes and the exception handlers that produce them.
 
 Every error response is `{"error": {"code", "message", "details"}}`. Messages and details never
-echo client input.
+echo client input, and database errors are logged as their class, SQLSTATE and constraint name
+only.
 """
 
+import logging
 from collections.abc import Mapping
 from enum import StrEnum
 from http import HTTPStatus
@@ -12,10 +14,15 @@ from typing import Final, cast
 
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.exceptions import HTTPException
+from starlette.requests import ClientDisconnect
 
 from task_platform.api.schemas import ErrorBody, ErrorResponse
 from task_platform.domain.errors import DomainError, ErrorCode, InvalidPayloadError
+
+logger = logging.getLogger(__name__)
 
 
 class ApiErrorCode(StrEnum):
@@ -25,6 +32,7 @@ class ApiErrorCode(StrEnum):
     INVALID_REQUEST = "invalid_request"
     NOT_FOUND = "not_found"
     METHOD_NOT_ALLOWED = "method_not_allowed"
+    SERVICE_UNAVAILABLE = "service_unavailable"
     INTERNAL_ERROR = "internal_error"
 
 
@@ -55,13 +63,21 @@ DOMAIN_ERROR_STATUS: Final[Mapping[ErrorCode, int]] = MappingProxyType(
 )
 
 
-# Routing raises these two itself (unknown path, wrong method).
+# Routing raises the first two itself (unknown path, wrong method).
 _HTTP_EXCEPTION_CODES: Final[Mapping[int, ApiErrorCode]] = MappingProxyType(
     {
         status.HTTP_404_NOT_FOUND: ApiErrorCode.NOT_FOUND,
         status.HTTP_405_METHOD_NOT_ALLOWED: ApiErrorCode.METHOD_NOT_ALLOWED,
+        # Same code as a database outage: either way the client should try again later.
+        status.HTTP_503_SERVICE_UNAVAILABLE: ApiErrorCode.SERVICE_UNAVAILABLE,
     }
 )
+
+
+# SQLSTATE classes that mean the database cannot serve the request right now, so a retry may work:
+# 08 connection exception, 53 insufficient resources (e.g. too many connections), 57 operator
+# intervention (57014 is a statement_timeout, 57P01 a server shutdown).
+_UNAVAILABLE_SQLSTATE_CLASSES: Final = frozenset({"08", "53", "57"})
 
 
 def error_response(
@@ -97,14 +113,100 @@ async def _handle_http_exception(request: Request, exc: Exception) -> JSONRespon
     code = _HTTP_EXCEPTION_CODES.get(error.status_code, fallback)
     # The standard phrase, not exc.detail: a detail passed by other code could hold input. The
     # headers are kept, e.g. Allow on a 405.
-    message = HTTPStatus(error.status_code).phrase.lower()
-    return error_response(error.status_code, code, message, headers=error.headers)
+    return error_response(
+        error.status_code, code, _status_phrase(error.status_code), headers=error.headers
+    )
+
+
+def _status_phrase(status_code: int) -> str:
+    try:
+        return HTTPStatus(status_code).phrase.lower()
+    except ValueError:  # Not a registered status, e.g. 499.
+        return "server error" if status_code >= 500 else "client error"
+
+
+def _service_unavailable() -> JSONResponse:
+    return error_response(
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        ApiErrorCode.SERVICE_UNAVAILABLE,
+        "service temporarily unavailable, try again later",
+    )
+
+
+def _sqlstate(error: SQLAlchemyError) -> str | None:
+    # SQLAlchemy's asyncpg adapter copies the code onto the driver error it wraps (exc.orig).
+    sqlstate = getattr(getattr(error, "orig", None), "sqlstate", None)
+    return sqlstate if isinstance(sqlstate, str) else None
+
+
+def _constraint_name(error: SQLAlchemyError) -> str | None:
+    # Only asyncpg's own exception has it, which the adapter chains as orig.__cause__. A schema
+    # identifier such as ck_jobs_max_attempts_range, never row data.
+    driver_error = getattr(getattr(error, "orig", None), "__cause__", None)
+    name = getattr(driver_error, "constraint_name", None)
+    return name if isinstance(name, str) else None
+
+
+def _class_name(exc: Exception) -> str:
+    # Qualified, because the bare name is ambiguous: sqlalchemy.exc.TimeoutError is a full pool,
+    # builtins.TimeoutError a database that stopped answering.
+    return f"{type(exc).__module__}.{type(exc).__qualname__}"
+
+
+def _is_unavailable(error: SQLAlchemyError, sqlstate: str | None) -> bool:
+    if isinstance(error, PoolTimeoutError):
+        return True
+    # A dropped connection, whatever the exception class (asyncpg reports it as InterfaceError).
+    if isinstance(error, DBAPIError) and error.connection_invalidated:
+        return True
+    return sqlstate is not None and sqlstate[:2] in _UNAVAILABLE_SQLSTATE_CLASSES
+
+
+# The database handlers below log only the class name, SQLSTATE and constraint name, never
+# str(exc) or a traceback: PostgreSQL's DETAIL (in the chained asyncpg error) can quote the whole
+# row, payload included. Being class-specific, they also stop Starlette from re-raising to uvicorn.
+
+
+async def _handle_database_error(request: Request, exc: Exception) -> JSONResponse:
+    error = cast(SQLAlchemyError, exc)
+    sqlstate = _sqlstate(error)
+    if _is_unavailable(error, sqlstate):
+        logger.warning("database unavailable: %s (sqlstate %s)", _class_name(error), sqlstate)
+        return _service_unavailable()
+    logger.error(
+        "database error: %s (sqlstate %s, constraint %s)",
+        _class_name(error),
+        sqlstate,
+        _constraint_name(error),
+    )
+    return error_response(
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
+        ApiErrorCode.INTERNAL_ERROR,
+        "internal server error",
+    )
+
+
+async def _handle_connection_error(request: Request, exc: Exception) -> JSONResponse:
+    # SQLAlchemy does not wrap these: a refused connection (ConnectionRefusedError) and asyncpg's
+    # connect and command timeouts (TimeoutError, an OSError subclass). The API does no other I/O,
+    # so any OSError is taken to mean the database is out of reach.
+    logger.warning("database unavailable: %s", _class_name(exc))
+    return _service_unavailable()
+
+
+async def _handle_client_disconnect(request: Request, exc: Exception) -> JSONResponse:
+    # The client hung up while sending the body, so nobody receives this response. Handled only
+    # to keep it out of the server-error tracebacks: it is not a bug here (decision Q1).
+    logger.info("client disconnected before the request body was read")
+    return error_response(
+        status.HTTP_400_BAD_REQUEST, ApiErrorCode.INVALID_REQUEST, "request body incomplete"
+    )
 
 
 async def _handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
     # Starlette re-raises the exception after this response is sent, and uvicorn logs its
-    # traceback (decision D7). So database errors, whose traceback holds PostgreSQL's DETAIL with
-    # the payload in it, need class-specific handlers of their own: those do not re-raise.
+    # traceback (decision D7). Database and connection errors never get here: their traceback
+    # would hold PostgreSQL's DETAIL, so they have the handlers above, which do not re-raise.
     return error_response(
         status.HTTP_500_INTERNAL_SERVER_ERROR,
         ApiErrorCode.INTERNAL_ERROR,
@@ -118,4 +220,7 @@ def register_error_handlers(app: FastAPI) -> None:
     # Replaces FastAPI's default, which answers {"detail": ...}. FastAPI's HTTPException is a
     # subclass, so it is covered too.
     app.add_exception_handler(HTTPException, _handle_http_exception)
+    app.add_exception_handler(SQLAlchemyError, _handle_database_error)
+    app.add_exception_handler(OSError, _handle_connection_error)
+    app.add_exception_handler(ClientDisconnect, _handle_client_disconnect)
     app.add_exception_handler(Exception, _handle_unexpected_error)

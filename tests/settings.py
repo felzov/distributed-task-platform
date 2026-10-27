@@ -2,6 +2,9 @@
 
 from task_platform.config import Settings
 
+# A closed port: any database access fails at once with ConnectionRefusedError.
+UNREACHABLE_DATABASE_URL = "postgresql+asyncpg://task_platform:unused@127.0.0.1:1/unused_test"
+
 
 def make_test_settings(url: str, **overrides: object) -> Settings:
     # A developer's .env and exported DB_* variables must not change what the tests measure:

@@ -3,9 +3,7 @@
 import json
 
 from task_platform.main import create_app
-from tests.settings import make_test_settings
-
-UNREACHABLE_DATABASE_URL = "postgresql+asyncpg://task_platform:unused@127.0.0.1:1/unused_test"
+from tests.settings import UNREACHABLE_DATABASE_URL, make_test_settings
 
 
 async def test_submit_request_body_schema_is_inline_and_complete() -> None:

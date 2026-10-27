@@ -60,6 +60,7 @@ def test_validation_errors_do_not_echo_env_file_values(
     [
         "db_connect_timeout_s",
         "db_statement_timeout_ms",
+        "db_command_timeout_s",
         "db_pool_size",
         "db_pool_timeout_s",
         "max_payload_bytes",
@@ -92,3 +93,17 @@ def test_body_limit_below_payload_limit_is_rejected() -> None:
 def test_body_limit_equal_to_payload_limit_is_accepted() -> None:
     result = settings(database_url=URL, max_payload_bytes=2_000, max_request_body_bytes=2_000)
     assert result.max_request_body_bytes == result.max_payload_bytes
+
+
+@pytest.mark.parametrize(
+    ("command_timeout_s", "accepted"), [(5.001, True), (5.0, False), (1.0, False)]
+)
+def test_command_timeout_must_outlast_statement_timeout(
+    command_timeout_s: float, accepted: bool
+) -> None:
+    values = {"db_statement_timeout_ms": 5_000, "db_command_timeout_s": command_timeout_s}
+    if accepted:
+        assert settings(database_url=URL, **values).db_command_timeout_s == command_timeout_s
+    else:
+        with pytest.raises(ValidationError, match="db_command_timeout_s must be longer"):
+            settings(database_url=URL, **values)

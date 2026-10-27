@@ -5,9 +5,9 @@ PostgreSQL, a dispatcher publishes them to RabbitMQ, and separate workers run th
 retries, so slow work stays out of the request path and every failure is recorded.
 
 > **Status: early development (phase 2 of 10).** So far there are the domain rules, a local
-> PostgreSQL with the `jobs` table migration, `POST /jobs` (validates and saves a job), and the
-> development checks (see Development setup). Everything else below, including scope and
-> limitations, describes the planned design, not working code.
+> PostgreSQL with the `jobs` table migration, `POST /jobs` (validates and saves a job; 503 when
+> the database is unavailable), and the development checks (see Development setup). Everything
+> else below, including scope and limitations, describes the planned design, not working code.
 
 ## Planned architecture
 
@@ -85,6 +85,16 @@ The ADRs refer to these phases by number.
 - A worker whose lease expired may still finish its handler. Its result is rejected, but its side
   effect can happen twice, so handlers with side effects must be idempotent (ADR 0001).
 - Recovering a crashed worker's job takes up to the lease duration plus the recovery interval.
+- **A submission whose COMMIT outcome is unknown can be saved twice.** If the connection drops or
+  `DB_COMMAND_TIMEOUT_S` expires while PostgreSQL commits, the client gets 503 although the job
+  may have been saved; a retry then creates a second job. Idempotency keys (phase 7) close this.
+- Database and connection errors are logged as their class, SQLSTATE and constraint name only,
+  without a traceback, because PostgreSQL's error detail can quote the stored payload. Any
+  `OSError` is treated as "database unavailable" (503). Other unexpected errors return 500 and
+  uvicorn logs their full traceback for debugging, so a bug whose traceback holds request data
+  could still write it to the log.
+- All limits and timeouts are placeholders, not measured values; `.env.example` lists every one
+  with its default (e.g. payload 64 KiB, statement timeout 5 s, client command timeout 10 s).
 
 ## Development setup
 

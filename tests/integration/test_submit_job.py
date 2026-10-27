@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from task_platform.config import Settings
 from task_platform.data.models import Base
+from task_platform.main import create_app
 from tests.app_client import app_client
 from tests.settings import make_test_settings
 
@@ -25,7 +26,7 @@ async def test_submitted_job_is_saved_as_queued(
 ) -> None:
     # Not the default of 5, so the row shows the value really comes from settings.
     settings = make_test_settings(test_database_url, default_max_attempts=3)
-    async with app_client(settings) as client:
+    async with app_client(create_app(settings)) as client:
         response = await client.post(
             "/jobs",
             json={"type": "notification.send", "payload_version": 1, "payload": PAYLOAD},
@@ -36,7 +37,8 @@ async def test_submitted_job_is_saved_as_queued(
     assert response.json() == {"id": str(job_id), "status": "queued"}
     assert response.headers["location"] == f"/jobs/{job_id}"
 
-    # Read through another connection: the row is visible, so it was committed before the 202.
+    # Read through another connection: the row is visible there, so the request committed it.
+    # (That the COMMIT comes before the 202 is the service's order: it returns after `begin()`.)
     async with engine.connect() as connection:
         result = await connection.execute(text("SELECT * FROM jobs WHERE id = :id"), {"id": job_id})
         row = result.mappings().one()
@@ -54,7 +56,7 @@ async def test_each_submission_creates_its_own_job(
     engine: AsyncEngine, test_settings: Settings
 ) -> None:
     body = {"type": "notification.send", "payload_version": 1, "payload": PAYLOAD}
-    async with app_client(test_settings) as client:
+    async with app_client(create_app(test_settings)) as client:
         first = await client.post("/jobs", json=body)
         second = await client.post("/jobs", json=body)
 
@@ -67,14 +69,22 @@ async def test_each_submission_creates_its_own_job(
 
 
 async def test_orm_model_matches_the_migrated_table(engine: AsyncEngine) -> None:
-    def describe(connection: Connection) -> tuple[dict[str, bool], list[str]]:
+    # Types compared as the DDL PostgreSQL would get, e.g. "TIMESTAMP WITH TIME ZONE".
+    def describe(connection: Connection) -> tuple[dict[str, tuple[str, bool]], list[str]]:
         inspector = inspect(connection)
-        columns = {column["name"]: column["nullable"] for column in inspector.get_columns("jobs")}
+        columns = {
+            column["name"]: (column["type"].compile(connection.dialect), column["nullable"])
+            for column in inspector.get_columns("jobs")
+        }
         return columns, inspector.get_pk_constraint("jobs")["constrained_columns"]
 
     async with engine.connect() as connection:
         db_columns, db_primary_key = await connection.run_sync(describe)
+        dialect = connection.dialect
 
     table = Base.metadata.tables["jobs"]
-    assert {column.name: column.nullable for column in table.columns} == db_columns
+    model_columns = {
+        column.name: (column.type.compile(dialect), column.nullable) for column in table.columns
+    }
+    assert model_columns == db_columns
     assert [column.name for column in table.primary_key] == db_primary_key

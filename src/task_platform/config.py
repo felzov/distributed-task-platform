@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     db_connect_timeout_s: float = Field(default=5.0, gt=0)
     # Server-side limit per statement, set on every connection.
     db_statement_timeout_ms: int = Field(default=5_000, gt=0)
+    # Client-side limit per command (asyncpg command_timeout), COMMIT included: a backstop for a
+    # server or network that stops answering, so it must be longer than the statement timeout.
+    db_command_timeout_s: float = Field(default=10.0, gt=0)
     db_pool_size: int = Field(default=5, ge=1)
     # How long a request waits for a free pooled connection.
     db_pool_timeout_s: float = Field(default=5.0, gt=0)
@@ -37,4 +40,12 @@ class Settings(BaseSettings):
         # Otherwise a payload under its own limit could never reach the payload check.
         if self.max_request_body_bytes < self.max_payload_bytes:
             raise ValueError("max_request_body_bytes must be at least max_payload_bytes")
+        return self
+
+    @model_validator(mode="after")
+    def _command_timeout_outlasts_statement_timeout(self) -> Self:
+        # Otherwise a slow statement is cut off by the client, which tells less than the server's
+        # cancellation (SQLSTATE 57014) and leaves the server to notice on its own.
+        if self.db_command_timeout_s * 1000 <= self.db_statement_timeout_ms:
+            raise ValueError("db_command_timeout_s must be longer than db_statement_timeout_ms")
         return self
