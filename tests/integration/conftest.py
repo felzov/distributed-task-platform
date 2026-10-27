@@ -11,11 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from task_platform.config import Settings
 from task_platform.data.db import create_db_engine
-from tests.integration.database import (
-    TestDatabaseError,
-    load_test_database_url,
-    make_test_settings,
-)
+from tests.integration.database import TestDatabaseError, load_test_database_url
+from tests.settings import make_test_settings
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 

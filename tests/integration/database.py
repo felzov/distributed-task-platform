@@ -5,8 +5,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
-from task_platform.config import Settings
-
 
 class TestDatabaseError(Exception):
     """The test database is missing or unsafe to use. Messages never contain the URL."""
@@ -44,14 +42,3 @@ def load_test_database_url(env_file: str | None = ".env") -> str:
     if not isinstance(database, str) or not database.endswith("_test"):
         raise TestDatabaseError("TEST_DATABASE_URL must name a database ending in '_test'")
     return url
-
-
-def make_test_settings(url: str, **overrides: object) -> Settings:
-    # A developer's .env and exported DB_* variables must not change what the tests measure:
-    # _env_file=None skips the file, and explicit arguments take precedence over the environment.
-    defaults = {
-        name: field.default
-        for name, field in Settings.model_fields.items()
-        if name != "database_url"
-    }
-    return Settings(_env_file=None, database_url=url, **(defaults | overrides))  # type: ignore[arg-type]

@@ -3,11 +3,8 @@
 import pytest
 
 from task_platform.config import Settings
-from tests.integration.database import (
-    TestDatabaseError,
-    load_test_database_url,
-    make_test_settings,
-)
+from tests.integration.database import TestDatabaseError, load_test_database_url
+from tests.settings import make_test_settings
 
 PASSWORD = "s3cr3t-sentinel-7731"
 

@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from task_platform.data.db import create_db_engine
 from task_platform.domain.job_status import JobStatus
-from tests.integration.database import make_test_settings
+from tests.settings import make_test_settings
 
 pytestmark = pytest.mark.integration
 
