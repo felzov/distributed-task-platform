@@ -1,6 +1,7 @@
 """Request and response bodies of the HTTP API."""
 
 import uuid
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
@@ -23,6 +24,22 @@ class SubmitJobRequest(BaseModel):
 class SubmitJobResponse(BaseModel):
     id: uuid.UUID
     status: JobStatus
+
+
+class JobResponse(BaseModel):
+    """Body of `GET /jobs/{id}`. Never the payload: it can hold personal data (e.g. a recipient)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    type: str
+    payload_version: int
+    status: JobStatus
+    attempts: int
+    max_attempts: int
+    available_at: datetime
+    created_at: datetime
+    updated_at: datetime
 
 
 class ErrorBody(BaseModel):

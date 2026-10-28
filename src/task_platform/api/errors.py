@@ -13,6 +13,7 @@ from types import MappingProxyType
 from typing import Final, cast
 
 from fastapi import FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
@@ -21,6 +22,7 @@ from starlette.requests import ClientDisconnect
 
 from task_platform.api.schemas import ErrorBody, ErrorResponse
 from task_platform.domain.errors import DomainError, ErrorCode, InvalidPayloadError
+from task_platform.domain.payloads import safe_error_details
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +61,7 @@ DOMAIN_ERROR_STATUS: Final[Mapping[ErrorCode, int]] = MappingProxyType(
         ErrorCode.PAYLOAD_TOO_LARGE: status.HTTP_413_CONTENT_TOO_LARGE,
         # Not raised by any endpoint yet; a request that conflicts with the job's state.
         ErrorCode.INVALID_TRANSITION: status.HTTP_409_CONFLICT,
+        ErrorCode.JOB_NOT_FOUND: status.HTTP_404_NOT_FOUND,
     }
 )
 
@@ -78,6 +81,16 @@ _HTTP_EXCEPTION_CODES: Final[Mapping[int, ApiErrorCode]] = MappingProxyType(
 # 08 connection exception, 53 insufficient resources (e.g. too many connections), 57 operator
 # intervention (57014 is a statement_timeout, 57P01 a server shutdown).
 _UNAVAILABLE_SQLSTATE_CLASSES: Final = frozenset({"08", "53", "57"})
+
+
+# OpenAPI entries for the errors every database-backed route can return.
+DATABASE_ERROR_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
+    status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": ErrorResponse},
+    status.HTTP_503_SERVICE_UNAVAILABLE: {
+        "model": ErrorResponse,
+        "description": "Database unavailable; try again later",
+    },
+}
 
 
 def error_response(
@@ -103,6 +116,19 @@ async def _handle_domain_error(request: Request, exc: Exception) -> JSONResponse
     error = cast(DomainError, exc)
     details = error.details if isinstance(error, InvalidPayloadError) else ()
     return error_response(DOMAIN_ERROR_STATUS[error.code], error.code, error.message, details)
+
+
+async def _handle_request_validation_error(request: Request, exc: Exception) -> JSONResponse:
+    # Replaces FastAPI's default 422, which returns each error's input, msg and ctx: all three can
+    # quote the client's value. Raised today only for path parameters (POST /jobs reads its body
+    # itself), e.g. "path.job_id: uuid_parsing".
+    error = cast(RequestValidationError, exc)
+    return error_response(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        ApiErrorCode.INVALID_REQUEST,
+        "request is not valid",
+        safe_error_details(error.errors(), root="request"),
+    )
 
 
 async def _handle_http_exception(request: Request, exc: Exception) -> JSONResponse:
@@ -217,6 +243,7 @@ async def _handle_unexpected_error(request: Request, exc: Exception) -> JSONResp
 def register_error_handlers(app: FastAPI) -> None:
     app.add_exception_handler(ApiError, _handle_api_error)
     app.add_exception_handler(DomainError, _handle_domain_error)
+    app.add_exception_handler(RequestValidationError, _handle_request_validation_error)
     # Replaces FastAPI's default, which answers {"detail": ...}. FastAPI's HTTPException is a
     # subclass, so it is covered too.
     app.add_exception_handler(HTTPException, _handle_http_exception)

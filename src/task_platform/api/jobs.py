@@ -1,15 +1,21 @@
-"""`POST /jobs`: read a size-capped body, validate the envelope, hand it to the service."""
+"""`POST /jobs` (size-capped body, envelope check, then the service) and `GET /jobs/{id}`."""
 
+import uuid
 from typing import Any, Final
 
 from fastapi import APIRouter, Request, Response, status
 from pydantic import ValidationError
 
 from task_platform.api.dependencies import AppSettings, SessionFactory
-from task_platform.api.errors import ApiError, ApiErrorCode
-from task_platform.api.schemas import ErrorResponse, SubmitJobRequest, SubmitJobResponse
+from task_platform.api.errors import DATABASE_ERROR_RESPONSES, ApiError, ApiErrorCode
+from task_platform.api.schemas import (
+    ErrorResponse,
+    JobResponse,
+    SubmitJobRequest,
+    SubmitJobResponse,
+)
 from task_platform.domain.payloads import safe_error_details
-from task_platform.services.jobs import submit_job
+from task_platform.services.jobs import get_job, submit_job
 
 router = APIRouter()
 
@@ -55,7 +61,9 @@ def parse_envelope(body: bytes) -> SubmitJobRequest:
     try:
         return SubmitJobRequest.model_validate_json(body)
     except ValidationError as exc:
-        details = safe_error_details(exc, root="body")
+        details = safe_error_details(
+            exc.errors(include_url=False, include_input=False), root="body"
+        )
     raise ApiError(
         status.HTTP_422_UNPROCESSABLE_CONTENT,
         ApiErrorCode.INVALID_REQUEST,
@@ -70,6 +78,7 @@ def parse_envelope(body: bytes) -> SubmitJobRequest:
     responses={
         status.HTTP_413_CONTENT_TOO_LARGE: {"model": ErrorResponse},
         status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": ErrorResponse},
+        **DATABASE_ERROR_RESPONSES,
     },
     openapi_extra=_REQUEST_BODY_DOC,
 )
@@ -90,3 +99,17 @@ async def post_job(
     )
     response.headers["Location"] = f"/jobs/{job.id}"
     return SubmitJobResponse(id=job.id, status=job.status)
+
+
+@router.get(
+    "/jobs/{job_id}",
+    responses={
+        status.HTTP_404_NOT_FOUND: {"model": ErrorResponse},
+        # Listing 422 here also replaces FastAPI's own HTTPValidationError schema in the docs.
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": ErrorResponse},
+        **DATABASE_ERROR_RESPONSES,
+    },
+)
+async def read_job(job_id: uuid.UUID, session_factory: SessionFactory) -> JobResponse:
+    """A job's current state, without its payload. An invalid UUID never reaches the database."""
+    return JobResponse.model_validate(await get_job(session_factory, job_id))

@@ -6,11 +6,12 @@ contain input values.
 """
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from types import MappingProxyType
 from typing import Final
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic_core import ErrorDetails
 
 from task_platform.domain.errors import (
     InvalidPayloadError,
@@ -87,18 +88,19 @@ def parse_payload(job_type: str, version: int, payload: object, *, max_bytes: in
     try:
         return model.model_validate(payload)
     except ValidationError as exc:
-        details = safe_error_details(exc)
+        details = safe_error_details(exc.errors(include_url=False, include_input=False))
     raise InvalidPayloadError(details)
 
 
-def safe_error_details(exc: ValidationError, *, root: str = "payload") -> tuple[str, ...]:
+def safe_error_details(errors: Iterable[ErrorDetails], *, root: str = "payload") -> tuple[str, ...]:
     """Describe validation errors as "<field>: <error type>" without any input value or key.
 
-    Only for flat models: payload models and the API's request envelope. `root` names the
+    Reads only `loc` and `type`: `input`, `msg` and `ctx` can all quote the input. Only for flat
+    models (payload models, the request envelope) and FastAPI's path parameters. `root` names the
     validated value itself, for errors without a field location.
     """
     details = []
-    for error in exc.errors(include_url=False, include_input=False):
+    for error in errors:
         if error["type"] in {"extra_forbidden", "invalid_key"}:
             # The location is the client's own key, which is input too.
             details.append("unexpected field")
