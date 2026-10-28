@@ -41,3 +41,29 @@ async def test_error_responses_use_the_envelope() -> None:
             assert responses[code]["content"]["application/json"]["schema"] == envelope
     # FastAPI documents its own 422 body unless a route lists 422; ours replaces it everywhere.
     assert "HTTPValidationError" not in json.dumps(spec)
+
+
+async def test_ready_documents_its_503_envelope() -> None:
+    app = create_app(make_test_settings(UNREACHABLE_DATABASE_URL))
+    try:
+        spec = app.openapi()
+    finally:
+        await app.state.engine.dispose()
+
+    response = spec["paths"]["/ready"]["get"]["responses"]["503"]
+    assert response["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ErrorResponse"
+    }
+
+
+async def test_probes_document_their_exact_status() -> None:
+    app = create_app(make_test_settings(UNREACHABLE_DATABASE_URL))
+    try:
+        spec = app.openapi()
+    finally:
+        await app.state.engine.dispose()
+
+    for path, value in (("/health", "ok"), ("/ready", "ready")):
+        ref = spec["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
+        name = ref["schema"]["$ref"].rsplit("/", 1)[-1]
+        assert spec["components"]["schemas"][name]["properties"]["status"]["const"] == value

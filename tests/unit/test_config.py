@@ -63,6 +63,7 @@ def test_validation_errors_do_not_echo_env_file_values(
         "db_command_timeout_s",
         "db_pool_size",
         "db_pool_timeout_s",
+        "ready_check_timeout_s",
         "max_payload_bytes",
         "max_request_body_bytes",
         "default_max_attempts",

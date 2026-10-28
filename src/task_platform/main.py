@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from task_platform.api import jobs
+from task_platform.api import health, jobs
 from task_platform.api.errors import register_error_handlers
 from task_platform.config import Settings
 from task_platform.data.db import create_db_engine
@@ -30,4 +30,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
     register_error_handlers(app)
     app.include_router(jobs.router)
+    app.include_router(health.router)
     return app

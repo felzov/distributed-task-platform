@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     db_pool_size: int = Field(default=5, ge=1)
     # How long a request waits for a free pooled connection.
     db_pool_timeout_s: float = Field(default=5.0, gt=0)
+    # Upper bound for the whole /ready check, waiting for a pooled connection included.
+    ready_check_timeout_s: float = Field(default=2.0, gt=0)
 
     # Size of the job payload as compact UTF-8 JSON (domain `payload_size_bytes`).
     max_payload_bytes: int = Field(default=64 * 1024, gt=0)
