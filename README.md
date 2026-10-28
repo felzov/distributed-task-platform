@@ -7,8 +7,9 @@ retries, so slow work stays out of the request path and every failure is recorde
 > **Status: early development (phase 2 of 10).** So far there are the domain rules, a local
 > PostgreSQL with the `jobs` table migration, `POST /jobs` (validates and saves a job; 503 when
 > the database is unavailable), `GET /jobs/{id}` (a job's state, never its payload), the `/health`
-> and `/ready` probes, and the development checks (see Development setup). Everything else below,
-> including scope and limitations, describes the planned design, not working code.
+> and `/ready` probes, and the development checks (see Development setup). The architecture,
+> MVP scope and roadmap describe the planned design; Known limitations covers both the planned
+> design and the code that exists.
 
 ## Planned architecture
 
@@ -56,8 +57,8 @@ flowchart LR
 
 The ADRs refer to these phases by number.
 
-1. Job contracts, statuses and architecture decisions *(in progress)*
-2. HTTP API and durable job records
+1. Job contracts, statuses and architecture decisions *(done)*
+2. HTTP API and durable job records *(in progress)*
 3. Dispatcher, RabbitMQ and the first worker
 4. Status and result endpoints
 5. Retries with exponential backoff and jitter
@@ -75,11 +76,28 @@ The ADRs refer to these phases by number.
 | [0002](docs/adr/0002-dual-write-strategy.md) | The jobs table is the outbox; a dispatcher publishes due jobs |
 | [0003](docs/adr/0003-async-io-stack.md) | asyncio throughout: SQLAlchemy asyncio, asyncpg, aio-pika |
 
+## Health and readiness probes
+
+- `GET /health` is liveness: it returns `200 {"status": "ok"}` whenever the process answers and
+  touches no dependency, so a liveness check on it never restarts the API because of a database
+  outage.
+- `GET /ready` returns `200 {"status": "ready"}` when PostgreSQL answers and its migration revision
+  is exactly the one this code expects. Otherwise it returns `503 service_unavailable` with
+  `details` naming the failed check, `["database"]` or `["migrations"]`, never an error text or a
+  revision id. The whole check is bounded by `READY_CHECK_TIMEOUT_S`.
+- `/ready` does **not** check RabbitMQ. The API never talks to the broker: it only saves jobs, and
+  a dispatcher publishes them (ADR 0002). An instance that can save jobs must keep accepting them
+  during a broker outage.
+- `/ready` takes its connection from the API's own pool, so it reports whether a request could get
+  a connection right now, not only whether PostgreSQL is up. A full pool therefore fails `/ready`
+  with `["database"]` even when PostgreSQL is fine, which takes a busy instance out of rotation.
+
 ## Known limitations
 
 - **No authentication.** Anyone who can reach the API can submit jobs, which means triggering
   notifications, and anyone who knows a job ID can read that job's status. Run it only on a trusted
-  network.
+  network. The same goes for `/ready`: it tells anyone who can reach it whether the database is
+  behind on migrations.
 - A worker crash uses up one of the job's attempts, even when the crash had nothing to do with the
   job (ADR 0001).
 - Dispatch latency is up to one dispatcher poll interval (ADR 0002).
@@ -94,6 +112,15 @@ The ADRs refer to these phases by number.
   `OSError` is treated as "database unavailable" (503). Other unexpected errors return 500 and
   uvicorn logs their full traceback for debugging, so a bug whose traceback holds request data
   could still write it to the log.
+- uvicorn's access log records each request's raw path, so job IDs, and whatever a client sent in
+  place of one, end up in the log. Payloads never do: they travel only in request bodies.
+- `/ready` requires the database revision to equal the code's exactly. During a rolling deploy,
+  instances running the old code report not ready as soon as the new migration is applied. The MVP
+  runs one instance and migrates before starting it.
+- Each failing `/ready` call logs one warning, so frequent probing during an outage produces many
+  identical lines. The database line includes pool usage (e.g. `pool 5/5 in use`), but under
+  traffic a slow database also fills the pool, so a full pool alone does not show the database is
+  healthy.
 - All limits and timeouts are placeholders, not measured values; `.env.example` lists every one
   with its default (e.g. payload 64 KiB, statement timeout 5 s, client command timeout 10 s).
 
