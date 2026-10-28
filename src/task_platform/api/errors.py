@@ -20,6 +20,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.exceptions import HTTPException
 from starlette.requests import ClientDisconnect
 
+from task_platform import safe_logging
 from task_platform.api.schemas import ErrorBody, ErrorResponse
 from task_platform.domain.errors import DomainError, ErrorCode, InvalidPayloadError
 from task_platform.domain.payloads import safe_error_details
@@ -159,24 +160,12 @@ def _service_unavailable() -> JSONResponse:
     )
 
 
-def _sqlstate(error: SQLAlchemyError) -> str | None:
-    # SQLAlchemy's asyncpg adapter copies the code onto the driver error it wraps (exc.orig).
-    sqlstate = getattr(getattr(error, "orig", None), "sqlstate", None)
-    return sqlstate if isinstance(sqlstate, str) else None
-
-
 def _constraint_name(error: SQLAlchemyError) -> str | None:
     # Only asyncpg's own exception has it, which the adapter chains as orig.__cause__. A schema
     # identifier such as ck_jobs_max_attempts_range, never row data.
     driver_error = getattr(getattr(error, "orig", None), "__cause__", None)
     name = getattr(driver_error, "constraint_name", None)
     return name if isinstance(name, str) else None
-
-
-def _class_name(exc: Exception) -> str:
-    # Qualified, because the bare name is ambiguous: sqlalchemy.exc.TimeoutError is a full pool,
-    # builtins.TimeoutError a database that stopped answering.
-    return f"{type(exc).__module__}.{type(exc).__qualname__}"
 
 
 def _is_unavailable(error: SQLAlchemyError, sqlstate: str | None) -> bool:
@@ -195,13 +184,15 @@ def _is_unavailable(error: SQLAlchemyError, sqlstate: str | None) -> bool:
 
 async def _handle_database_error(request: Request, exc: Exception) -> JSONResponse:
     error = cast(SQLAlchemyError, exc)
-    sqlstate = _sqlstate(error)
+    sqlstate = safe_logging.sqlstate(error)
     if _is_unavailable(error, sqlstate):
-        logger.warning("database unavailable: %s (sqlstate %s)", _class_name(error), sqlstate)
+        logger.warning(
+            "database unavailable: %s (sqlstate %s)", safe_logging.class_name(error), sqlstate
+        )
         return _service_unavailable()
     logger.error(
         "database error: %s (sqlstate %s, constraint %s)",
-        _class_name(error),
+        safe_logging.class_name(error),
         sqlstate,
         _constraint_name(error),
     )
@@ -216,7 +207,7 @@ async def _handle_connection_error(request: Request, exc: Exception) -> JSONResp
     # SQLAlchemy does not wrap these: a refused connection (ConnectionRefusedError) and asyncpg's
     # connect and command timeouts (TimeoutError, an OSError subclass). The API does no other I/O,
     # so any OSError is taken to mean the database is out of reach.
-    logger.warning("database unavailable: %s", _class_name(exc))
+    logger.warning("database unavailable: %s", safe_logging.class_name(exc))
     return _service_unavailable()
 
 
