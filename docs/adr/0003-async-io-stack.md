@@ -1,6 +1,6 @@
 # ADR 0003 — Async I/O stack: SQLAlchemy asyncio, asyncpg, aio-pika
 
-- **Status:** Accepted (updated 2026-10-28)
+- **Status:** Accepted (updated 2026-10-28, 2026-10-29)
 - **Date:** 2026-10-24
 
 ## Context
@@ -39,6 +39,9 @@ Alembic's `migrations/env.py` is based on the async template and uses the same `
 so there is no second, sync driver: it opens an async engine with `NullPool`, runs the hand-written
 revisions through `run_sync`, and drives it with `asyncio.run`. It sets the connect timeout but no
 statement timeout, because a migration may legitimately run longer than an API query.
+
+**Update 2026-10-29 (phase 3):** the queue type left open in the context is decided by ADR 0004: a
+quorum queue, which requires RabbitMQ 4.3 or later.
 
 ## Consequences
 
