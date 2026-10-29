@@ -18,6 +18,26 @@ jobs:
     env:
       # Overrides .python-version so `uv run` (inside make) keeps the matrix interpreter.
       UV_PYTHON: ${{ matrix.python-version }}
+      # Throwaway credentials for the service container below; it only lives for this job.
+      TEST_DATABASE_URL: postgresql+asyncpg://task_platform:ci-only@127.0.0.1:5432/task_platform_test
+
+    services:
+      postgres:
+        # Same image and digest as compose.yaml.
+        image: postgres:18.6-alpine@sha256:898c60cb390d1085bc97bdd6a1ae968757421df394b071848b52b1c09c89d6a5
+        env:
+          POSTGRES_USER: task_platform
+          POSTGRES_PASSWORD: ci-only
+          POSTGRES_DB: task_platform_test
+        ports:
+          - 5432:5432
+        # TCP health check, as in compose.yaml: the socket is up before init has finished.
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U task_platform -d task_platform_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+          --health-start-period 30s
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -31,6 +51,9 @@ jobs:
 
       - name: Lint, typecheck and unit tests
         run: make check
+
+      - name: Integration tests (PostgreSQL)
+        run: make test-integration
 
   secrets:
     # The gitleaks pre-commit hook only scans staged changes and only where hooks are installed,

@@ -13,6 +13,7 @@ class ErrorCode(StrEnum):
     UNSUPPORTED_PAYLOAD_VERSION = "unsupported_payload_version"
     PAYLOAD_TOO_LARGE = "payload_too_large"
     INVALID_PAYLOAD = "invalid_payload"
+    JOB_NOT_FOUND = "job_not_found"
 
 
 class DomainError(Exception):
@@ -67,3 +68,11 @@ class InvalidPayloadError(DomainError):
         super().__init__("payload does not match the schema for this job type")
         # Each detail is "<schema field>: <error type>"; never an input value.
         self.details = details
+
+
+class JobNotFoundError(DomainError):
+    code = ErrorCode.JOB_NOT_FOUND
+
+    def __init__(self) -> None:
+        # The id is client input, so it is not repeated here.
+        super().__init__("job not found")
