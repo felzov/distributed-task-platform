@@ -35,10 +35,10 @@ for quorum queues; the queue type is decided in phase 3.
    separate sync driver) is also decided in phase 2.
 
 **Update 2026-10-28 (phase 2):** decision 6 is closed. Async tests use `pytest-asyncio` as planned.
-Alembic uses the async template on the same `asyncpg` driver, so there is no second, sync driver:
-`migrations/env.py` opens an async engine with `NullPool`, runs the hand-written revisions through
-`run_sync`, and drives it with `asyncio.run`. It sets the connect timeout but no statement timeout,
-because a migration may legitimately run longer than an API query.
+Alembic's `migrations/env.py` is based on the async template and uses the same `asyncpg` driver,
+so there is no second, sync driver: it opens an async engine with `NullPool`, runs the hand-written
+revisions through `run_sync`, and drives it with `asyncio.run`. It sets the connect timeout but no
+statement timeout, because a migration may legitimately run longer than an API query.
 
 ## Consequences
 

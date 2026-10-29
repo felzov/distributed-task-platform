@@ -97,7 +97,7 @@ The ADRs refer to these phases by number.
 - **No authentication.** Anyone who can reach the API can submit jobs, which means triggering
   notifications, and anyone who knows a job ID can read that job's status. Run it only on a trusted
   network. The same goes for `/ready`: it tells anyone who can reach it whether the database is
-  behind on migrations.
+  at this code's migration revision.
 - A worker crash uses up one of the job's attempts, even when the crash had nothing to do with the
   job (ADR 0001).
 - Dispatch latency is up to one dispatcher poll interval (ADR 0002).
@@ -112,8 +112,9 @@ The ADRs refer to these phases by number.
   `OSError` is treated as "database unavailable" (503). Other unexpected errors return 500 and
   uvicorn logs their full traceback for debugging, so a bug whose traceback holds request data
   could still write it to the log.
-- uvicorn's access log records each request's raw path, so job IDs, and whatever a client sent in
-  place of one, end up in the log. Payloads never do: they travel only in request bodies.
+- uvicorn's access log records each request's raw path and query string, so job IDs, whatever a
+  client sent in place of one and anything after a `?` end up in the log. Payloads never do: they
+  travel only in request bodies.
 - `/ready` requires the database revision to equal the code's exactly. During a rolling deploy,
   instances running the old code report not ready as soon as the new migration is applied. The MVP
   runs one instance and migrates before starting it.
