@@ -1,6 +1,6 @@
 # ADR 0003 — Async I/O stack: SQLAlchemy asyncio, asyncpg, aio-pika
 
-- **Status:** Accepted (updated 2026-10-28)
+- **Status:** Accepted (updated 2026-10-28, 2026-10-29)
 - **Date:** 2026-10-24
 
 ## Context
@@ -35,10 +35,13 @@ for quorum queues; the queue type is decided in phase 3.
    separate sync driver) is also decided in phase 2.
 
 **Update 2026-10-28 (phase 2):** decision 6 is closed. Async tests use `pytest-asyncio` as planned.
-Alembic uses the async template on the same `asyncpg` driver, so there is no second, sync driver:
-`migrations/env.py` opens an async engine with `NullPool`, runs the hand-written revisions through
-`run_sync`, and drives it with `asyncio.run`. It sets the connect timeout but no statement timeout,
-because a migration may legitimately run longer than an API query.
+Alembic's `migrations/env.py` is based on the async template and uses the same `asyncpg` driver,
+so there is no second, sync driver: it opens an async engine with `NullPool`, runs the hand-written
+revisions through `run_sync`, and drives it with `asyncio.run`. It sets the connect timeout but no
+statement timeout, because a migration may legitimately run longer than an API query.
+
+**Update 2026-10-29 (phase 3):** the queue type left open in the context is decided by ADR 0004: a
+quorum queue, which requires RabbitMQ 4.3 or later.
 
 ## Consequences
 

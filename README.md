@@ -4,12 +4,13 @@ A background-job system built to make failure behaviour explicit: an HTTP API sa
 PostgreSQL, a dispatcher publishes them to RabbitMQ, and separate workers run them with bounded
 retries, so slow work stays out of the request path and every failure is recorded.
 
-> **Status: early development (phase 2 of 10).** So far there are the domain rules, a local
+> **Status: early development (phase 3 of 10).** So far there are the domain rules, a local
 > PostgreSQL with the `jobs` table migration, `POST /jobs` (validates and saves a job; 503 when
 > the database is unavailable), `GET /jobs/{id}` (a job's state, never its payload), the `/health`
-> and `/ready` probes, and the development checks (see Development setup). The architecture,
-> MVP scope and roadmap describe the planned design; Known limitations covers both the planned
-> design and the code that exists.
+> and `/ready` probes, a local RabbitMQ with the connection and queue code (no dispatcher or worker
+> yet), and the development checks (see Development setup). The architecture, MVP scope and
+> roadmap describe the planned design; Known limitations covers both the planned design and the
+> code that exists.
 
 ## Planned architecture
 
@@ -75,6 +76,7 @@ The ADRs refer to these phases by number.
 | [0001](docs/adr/0001-job-lifecycle.md) | Four job statuses; attempts counted when a worker claims a job |
 | [0002](docs/adr/0002-dual-write-strategy.md) | The jobs table is the outbox; a dispatcher publishes due jobs |
 | [0003](docs/adr/0003-async-io-stack.md) | asyncio throughout: SQLAlchemy asyncio, asyncpg, aio-pika |
+| [0004](docs/adr/0004-dispatch-and-consumption.md) | One quorum queue; the worker acks, nacks or rejects per outcome |
 
 ## Health and readiness probes
 
@@ -97,7 +99,7 @@ The ADRs refer to these phases by number.
 - **No authentication.** Anyone who can reach the API can submit jobs, which means triggering
   notifications, and anyone who knows a job ID can read that job's status. Run it only on a trusted
   network. The same goes for `/ready`: it tells anyone who can reach it whether the database is
-  behind on migrations.
+  at this code's migration revision.
 - A worker crash uses up one of the job's attempts, even when the crash had nothing to do with the
   job (ADR 0001).
 - Dispatch latency is up to one dispatcher poll interval (ADR 0002).
@@ -112,8 +114,9 @@ The ADRs refer to these phases by number.
   `OSError` is treated as "database unavailable" (503). Other unexpected errors return 500 and
   uvicorn logs their full traceback for debugging, so a bug whose traceback holds request data
   could still write it to the log.
-- uvicorn's access log records each request's raw path, so job IDs, and whatever a client sent in
-  place of one, end up in the log. Payloads never do: they travel only in request bodies.
+- uvicorn's access log records each request's raw path and query string, so job IDs, whatever a
+  client sent in place of one and anything after a `?` end up in the log. Payloads never do: they
+  travel only in request bodies.
 - `/ready` requires the database revision to equal the code's exactly. During a rolling deploy,
   instances running the old code report not ready as soon as the new migration is applied. The MVP
   runs one instance and migrates before starting it.
@@ -133,23 +136,26 @@ Python (3.12, see `.python-version`) if it is missing.
 make install                  # create .venv and install locked dependencies
 uv run pre-commit install     # run lint, format, mypy and secret checks on every commit
 cp .env.example .env          # then replace every change-me with a local password
-make db-up                    # start PostgreSQL on 127.0.0.1:5432 and wait until it is healthy
+make up                       # start PostgreSQL (127.0.0.1:5432) and RabbitMQ (127.0.0.1:5672)
 make db-migrate               # apply migrations to the development database
 make run                      # start the API on 127.0.0.1:8000 (docs at /docs)
 make check                    # lint, format check, mypy --strict, unit tests
-make test-integration         # tests against the task_platform_test database
+make test-integration         # tests against task_platform_test and the local RabbitMQ
 make check-all                # both of the above
 make format                   # apply ruff formatting and safe lint fixes
-make db-down                  # stop PostgreSQL; the data volume is kept
+make down                     # stop both; the data volumes are kept
 ```
 
-- The password in `.env` is applied only when the PostgreSQL volume is first created, and the
-  `task_platform_test` database is created at the same moment. Changing either later requires
-  recreating the volume (`docker compose down -v`, which deletes all local data).
-- Integration tests fail, rather than skip, when `TEST_DATABASE_URL` is missing, and refuse any
-  database whose name does not end in `_test`.
+- The passwords in `.env` are applied only when each container's volume is first created, and
+  the `task_platform_test` database is created at the same moment. Changing them later requires
+  recreating the volumes (`docker compose down -v`, which deletes all local data).
+- `make up` waits until both healthchecks pass: PostgreSQL accepts connections and RabbitMQ's
+  AMQP listener is up.
+- Integration tests fail, rather than skip, when `TEST_DATABASE_URL` or `TEST_BROKER_URL` is
+  missing, and refuse any database whose name does not end in `_test`. Broker tests declare
+  queues with unique names and delete only those, so they can share the local RabbitMQ.
 - Migrations are written by hand, never autogenerated:
   `make db-revision id=0002 m="what it does"` creates an empty revision to fill in.
 
-CI runs `make check` and the integration tests against a PostgreSQL service container on Python
-3.12 and 3.14, and scans the full git history for secrets with gitleaks.
+CI runs `make check` and the integration tests against PostgreSQL and RabbitMQ service containers
+on Python 3.12 and 3.14, and scans the full git history for secrets with gitleaks.

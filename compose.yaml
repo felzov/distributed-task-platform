@@ -25,5 +25,28 @@ services:
       # Failed checks during first-time init do not count towards `retries`.
       start_period: 30s
 
+  rabbitmq:
+    # RabbitMQ 4.3 or later is required (ADR 0004). Same image and digest as CI's service container.
+    image: rabbitmq:4.3.7-alpine@sha256:b1f997f74103d08fc1f20a13890dc44fe6cfa51d528cf521b480ada988d3ffa5
+    # RabbitMQ keeps its data under the node name rabbit@<hostname>; a fixed hostname keeps the
+    # same data (users, queues, messages) when the container is recreated.
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: task_platform
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env (see .env.example)}
+    ports:
+      # AMQP only, reachable only from this machine. No management UI.
+      - "127.0.0.1:5672:5672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      # Passes once the AMQP listener accepts connections, not just when the node is up.
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q check_port_connectivity"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
 volumes:
   postgres-data:
+  rabbitmq-data:
