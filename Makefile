@@ -1,7 +1,7 @@
 .RECIPEPREFIX = >
 
 .PHONY: install lint format typecheck test test-integration check check-all run \
-	db-up db-down db-migrate db-revision
+	up down db-migrate db-revision
 
 install:
 > uv sync
@@ -21,7 +21,7 @@ typecheck:
 test:
 > uv run pytest -m "not integration"
 
-# Needs PostgreSQL (`make db-up`) and TEST_DATABASE_URL; fails instead of skipping without them.
+# Needs `make up`, TEST_DATABASE_URL and TEST_BROKER_URL; fails instead of skipping without them.
 test-integration:
 > uv run pytest -m integration
 
@@ -30,16 +30,16 @@ check: lint typecheck test
 
 check-all: check test-integration
 
-# The API on 127.0.0.1:8000. Needs .env, `make db-up` and `make db-migrate`.
+# The API on 127.0.0.1:8000. Needs .env, `make up` and `make db-migrate`.
 run:
 > uv run uvicorn task_platform.main:create_app --factory --host 127.0.0.1 --port 8000
 
-# Starts PostgreSQL and waits until its healthcheck passes.
-db-up:
+# Starts PostgreSQL and RabbitMQ and waits until both healthchecks pass.
+up:
 > docker compose up -d --wait
 
-# Stops the containers and keeps the data volume. Deleting it (`down -v`) is a manual decision.
-db-down:
+# Stops the containers and keeps the data volumes. Deleting them (`down -v`) is a manual decision.
+down:
 > docker compose down
 
 db-migrate:

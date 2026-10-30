@@ -5,7 +5,7 @@ All limits and timeouts are explicit here. The defaults are placeholders, not me
 
 from typing import Self
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -51,3 +51,28 @@ class Settings(BaseSettings):
         if self.db_command_timeout_s * 1000 <= self.db_statement_timeout_ms:
             raise ValueError("db_command_timeout_s must be longer than db_statement_timeout_ms")
         return self
+
+
+class BrokerSettings(Settings):
+    """Settings of the processes that talk to RabbitMQ: the dispatcher and the worker.
+
+    The API uses `Settings`: it never talks to the broker (ADR 0002), so broker configuration can
+    neither be required by it nor break it.
+    """
+
+    broker_url: SecretStr
+    # Bounds the first connection attempt, which is not retried (the process stops instead).
+    broker_connect_timeout_s: float = Field(default=5.0, gt=0)
+    # Sent in Connection.Tune-Ok, replacing the broker's proposal; missed heartbeats close it.
+    # The AMQP field is 16 bits, and aiormq sends 0 (heartbeats off) for 65535 or more.
+    broker_heartbeat_s: int = Field(default=60, ge=1, le=65534)
+    # RabbitMQ caps names at 255 bytes; ASCII only here, so that is 255 characters.
+    jobs_queue_name: str = Field(default="jobs", max_length=255, pattern=r"^[A-Za-z0-9._-]+$")
+
+    @field_validator("jobs_queue_name")
+    @classmethod
+    def _not_reserved(cls, name: str) -> str:
+        # RabbitMQ refuses to declare a queue whose name starts with "amq.".
+        if name.startswith("amq."):
+            raise ValueError("jobs_queue_name must not start with 'amq.'")
+        return name

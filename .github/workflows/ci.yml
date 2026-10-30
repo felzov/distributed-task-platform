@@ -11,6 +11,9 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # A hung test (e.g. a broker connect without its timeout) fails the run instead of using up
+    # GitHub's 6-hour default. A full run has taken well under a minute so far.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -20,6 +23,7 @@ jobs:
       UV_PYTHON: ${{ matrix.python-version }}
       # Throwaway credentials for the service container below; it only lives for this job.
       TEST_DATABASE_URL: postgresql+asyncpg://task_platform:ci-only@127.0.0.1:5432/task_platform_test
+      TEST_BROKER_URL: amqp://task_platform:ci-only@127.0.0.1:5672/
 
     services:
       postgres:
@@ -38,6 +42,21 @@ jobs:
           --health-timeout 3s
           --health-retries 15
           --health-start-period 30s
+      rabbitmq:
+        # Same image and digest as compose.yaml.
+        image: rabbitmq:4.3.7-alpine@sha256:b1f997f74103d08fc1f20a13890dc44fe6cfa51d528cf521b480ada988d3ffa5
+        env:
+          RABBITMQ_DEFAULT_USER: task_platform
+          RABBITMQ_DEFAULT_PASS: ci-only
+        ports:
+          - 5672:5672
+        # As in compose.yaml: healthy once the AMQP listener accepts connections.
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_port_connectivity"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 12
+          --health-start-period 30s
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -52,7 +71,7 @@ jobs:
       - name: Lint, typecheck and unit tests
         run: make check
 
-      - name: Integration tests (PostgreSQL)
+      - name: Integration tests (PostgreSQL, RabbitMQ)
         run: make test-integration
 
   secrets:
