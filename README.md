@@ -5,12 +5,13 @@ PostgreSQL, a dispatcher publishes them to RabbitMQ, and separate workers run th
 retries, so slow work stays out of the request path and every failure is recorded.
 
 > **Status: early development (phase 3 of 10).** So far there are the domain rules, a local
-> PostgreSQL with the `jobs` table migration, `POST /jobs` (validates and saves a job; 503 when
-> the database is unavailable), `GET /jobs/{id}` (a job's state, never its payload), the `/health`
-> and `/ready` probes, a local RabbitMQ with the connection and queue code (no dispatcher or worker
-> yet), and the development checks (see Development setup). The architecture, MVP scope and
-> roadmap describe the planned design; Known limitations covers both the planned design and the
-> code that exists.
+> PostgreSQL with migrations for the `jobs` table (including the lease, error and result columns
+> the worker will write) and the fake provider's `fake_notifications` table, `POST /jobs`
+> (validates and saves a job; 503 when the database is unavailable), `GET /jobs/{id}` (a job's
+> state, never its payload), the `/health` and `/ready` probes, a local RabbitMQ with the
+> connection and queue code (no dispatcher or worker yet), and the development checks (see
+> Development setup). The architecture, MVP scope and roadmap describe the planned design; Known
+> limitations covers both the planned design and the code that exists.
 
 ## Planned architecture
 

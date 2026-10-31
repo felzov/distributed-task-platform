@@ -2,6 +2,7 @@
 
 import re
 import traceback
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -11,28 +12,13 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from task_platform.data.db import create_db_engine
 from task_platform.domain.job_status import JobStatus
+from tests.integration.rows import insert_job
 from tests.settings import make_test_settings
 
 pytestmark = pytest.mark.integration
 
-
-async def insert_job(engine: AsyncEngine, **overrides: Any) -> dict[str, Any]:
-    """Insert one row with raw SQL (no ORM) and return it as a dict."""
-    values: dict[str, Any] = {
-        "type": "notification.send",
-        "payload_version": 1,
-        "payload": '{"recipient": "max@example.com"}',
-        "max_attempts": 5,
-    } | overrides
-    columns = ", ".join(values)
-    params = ", ".join(
-        "CAST(:payload AS jsonb)" if column == "payload" else f":{column}" for column in values
-    )
-    async with engine.begin() as connection:
-        result = await connection.execute(
-            text(f"INSERT INTO jobs ({columns}) VALUES ({params}) RETURNING *"), values
-        )
-        return dict(result.mappings().one())
+# Any instant will do: the CHECK asks only that a running job has a lease.
+LEASE = {"lease_expires_at": datetime(2026, 1, 1, tzinfo=UTC)}
 
 
 # Normal path
@@ -52,7 +38,9 @@ async def test_defaults_come_from_postgres(engine: AsyncEngine) -> None:
 
 @pytest.mark.parametrize("status", list(JobStatus))
 async def test_every_domain_status_is_accepted(engine: AsyncEngine, status: JobStatus) -> None:
-    row = await insert_job(engine, status=status.value)
+    # Since migration 0002 a running job needs a lease (ck_jobs_running_has_lease).
+    lease = LEASE if status is JobStatus.RUNNING else {}
+    row = await insert_job(engine, status=status.value, **lease)
     assert row["status"] == status.value
 
 
@@ -78,6 +66,12 @@ async def test_status_constraint_lists_exactly_the_domain_statuses(engine: Async
         {"max_attempts": 20},
         {"type": "x"},
         {"type": "x" * 100},
+        {"error_code": "x"},
+        {"error_code": "x" * 100},
+        # Not tied to status: a retried job keeps its last error while queued (phase 5).
+        {"status": "queued", "error_code": "handler_failed"},
+        {"status": "failed", **LEASE},
+        {"result": '{"sent": true}'},
     ],
 )
 async def test_boundary_values_are_accepted(engine: AsyncEngine, overrides: dict[str, Any]) -> None:
@@ -99,6 +93,9 @@ async def test_boundary_values_are_accepted(engine: AsyncEngine, overrides: dict
         ({"payload_version": 0}, "ck_jobs_payload_version_positive"),
         ({"type": ""}, "ck_jobs_type_length"),
         ({"type": "x" * 101}, "ck_jobs_type_length"),
+        ({"error_code": ""}, "ck_jobs_error_code_length"),
+        ({"error_code": "x" * 101}, "ck_jobs_error_code_length"),
+        ({"status": "running"}, "ck_jobs_running_has_lease"),
     ],
 )
 async def test_constraint_violations_are_rejected(

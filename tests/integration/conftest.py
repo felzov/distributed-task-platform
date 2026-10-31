@@ -53,7 +53,8 @@ async def engine(migrated_database: None, test_settings: Settings) -> AsyncItera
     # Created per test: asyncpg connections belong to the event loop that opened them.
     engine = create_db_engine(test_settings)
     async with engine.begin() as connection:
-        await connection.execute(text("TRUNCATE jobs"))
+        # Both at once: fake_notifications references jobs.
+        await connection.execute(text("TRUNCATE jobs, fake_notifications"))
         # Left behind only if a run was killed inside test_command_timeout_also_bounds_commit; it
         # would make every later INSERT sleep 2 s at COMMIT.
         await connection.execute(text("DROP TRIGGER IF EXISTS test_slow_commit ON jobs"))

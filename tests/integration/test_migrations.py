@@ -3,6 +3,7 @@ import asyncio
 import pytest
 from alembic import command
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from task_platform.config import Settings
 from task_platform.data.db import create_db_engine
@@ -33,7 +34,13 @@ async def migrate(settings: Settings, direction: str, target: str) -> None:
 
 
 async def test_migrations_go_up_down_and_up_again(test_settings: Settings) -> None:
-    jobs_objects = {"jobs", "pk_jobs", "ix_jobs_dispatch_due"}
+    jobs_objects = {
+        "jobs",
+        "pk_jobs",
+        "ix_jobs_dispatch_due",
+        "fake_notifications",
+        "pk_fake_notifications",
+    }
 
     await migrate(test_settings, "up", "head")
     assert jobs_objects <= await schema_objects(test_settings)
@@ -62,3 +69,63 @@ async def test_dispatch_index_is_partial_on_due_unpublished_jobs(test_settings: 
     assert definition is not None
     assert "(available_at)" in definition
     assert "WHERE ((status = 'queued'::text) AND (dispatched_at IS NULL))" in definition
+
+
+async def jobs_columns(settings: Settings) -> set[str]:
+    engine = create_db_engine(settings)
+    try:
+        async with engine.connect() as connection:
+            columns = await connection.scalars(
+                text("SELECT column_name FROM information_schema.columns WHERE table_name = 'jobs'")
+            )
+            return set(columns)
+    finally:
+        await engine.dispose()
+
+
+async def test_existing_jobs_survive_0002_and_its_downgrade(
+    engine: AsyncEngine, test_settings: Settings
+) -> None:
+    # `engine` empties the tables first. A running row left by an earlier test would lose its
+    # lease in the downgrade and then fail ck_jobs_running_has_lease on the way back up.
+    new_columns = {"lease_expires_at", "error_code", "result"}
+    try:
+        await migrate(test_settings, "down", "0001")
+        assert not new_columns & await jobs_columns(test_settings)
+        # A job saved before phase 3, as the API wrote it.
+        async with engine.begin() as connection:
+            job_id = await connection.scalar(
+                text(
+                    "INSERT INTO jobs (type, payload_version, payload, max_attempts)"
+                    " VALUES ('notification.send', 1, '{}', 5) RETURNING id"
+                )
+            )
+
+        await migrate(test_settings, "up", "0002")
+        assert new_columns <= await jobs_columns(test_settings)
+        async with engine.connect() as connection:
+            row = (
+                await connection.execute(
+                    text(
+                        "SELECT status, lease_expires_at, error_code, result FROM jobs"
+                        " WHERE id = :id"
+                    ),
+                    {"id": job_id},
+                )
+            ).one()
+        # No backfill: the new columns start empty, and a queued job needs no lease.
+        assert tuple(row) == ("queued", None, None, None)
+
+        # The downgrade keeps the row and drops only what 0002 added.
+        await migrate(test_settings, "down", "0001")
+        assert not new_columns & await jobs_columns(test_settings)
+        async with engine.connect() as connection:
+            assert (
+                await connection.scalar(
+                    text("SELECT count(*) FROM jobs WHERE id = :id"), {"id": job_id}
+                )
+                == 1
+            )
+    finally:
+        # Shared test database: leave it at head, as the test above does.
+        await migrate(test_settings, "up", "head")
