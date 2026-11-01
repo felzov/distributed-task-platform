@@ -1,13 +1,15 @@
 """Queries on the jobs table. Each one is an explicit statement; callers own the transaction."""
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import Row, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.dml import ReturningUpdate
 
 from task_platform.data.models import Job
+from task_platform.domain.errors import ErrorCode
 
 
 async def insert_job(
@@ -95,3 +97,72 @@ async def mark_dispatched(session: AsyncSession, job_ids: list[uuid.UUID]) -> in
         .returning(Job.id)
     )
     return len((await session.scalars(statement)).all())
+
+
+# attempts (the claimed attempt, used to fence later writes), type, payload_version, payload
+ClaimedJobRow = Row[int, str, int, dict[str, Any]]
+
+
+async def claim_job(
+    session: AsyncSession, job_id: uuid.UUID, *, lease_duration_s: float
+) -> ClaimedJobRow | None:
+    """Move a due `queued` job to `running` for one attempt, or return None if it is not claimable.
+
+    None is the normal outcome of a duplicate or stale delivery: the job is not due yet, or
+    another worker already has it or finished it (ADR 0001 decision 7). Of two concurrent claims,
+    the second waits for the first's row lock and then finds the job no longer `queued`. A `queued`
+    job with no attempts left also returns None instead of breaking the attempts CHECK. So does an
+    unknown job: a caller that treats that case differently (ADR 0004) has to look the job up.
+    """
+    statement = (
+        update(Job)
+        .where(
+            Job.id == job_id,
+            Job.status == "queued",
+            Job.available_at <= func.now(),
+            # Retries and recovery requeue only below the budget (ADR 0001); the database does not
+            # enforce that for queued rows, and a CHECK error here would look like a DB outage.
+            Job.attempts < Job.max_attempts,
+        )
+        .values(
+            status="running",
+            attempts=Job.attempts + 1,
+            # A duration from the caller, a timestamp from PostgreSQL's clock (ADR 0001 decision 9).
+            lease_expires_at=func.now() + timedelta(seconds=lease_duration_s),
+            updated_at=func.now(),
+        )
+        # The handler needs the payload. Result rows are logged at DEBUG (limitation, phase 8).
+        .returning(Job.attempts, Job.type, Job.payload_version, Job.payload)
+    )
+    return (await session.execute(statement)).one_or_none()
+
+
+async def mark_succeeded(
+    session: AsyncSession, job_id: uuid.UUID, *, claimed_attempt: int, result: dict[str, Any]
+) -> bool:
+    """Finish a claimed attempt as `succeeded`; False if that attempt is no longer current."""
+    statement = _fenced_finish(job_id, claimed_attempt).values(status="succeeded", result=result)
+    return (await session.scalar(statement)) is not None
+
+
+async def mark_failed(
+    session: AsyncSession, job_id: uuid.UUID, *, claimed_attempt: int, error_code: ErrorCode
+) -> bool:
+    """Finish a claimed attempt as `failed`; False if that attempt is no longer current."""
+    statement = _fenced_finish(job_id, claimed_attempt).values(
+        status="failed", error_code=error_code
+    )
+    return (await session.scalar(statement)) is not None
+
+
+def _fenced_finish(job_id: uuid.UUID, claimed_attempt: int) -> ReturningUpdate[tuple[uuid.UUID]]:
+    # Fenced (ADR 0001 decision 7): if the job was recovered and claimed again, or this attempt
+    # already finished, no row matches and the stale write is discarded. The callers add their own
+    # columns; UPDATE merges repeated .values().
+    return (
+        update(Job)
+        .where(Job.id == job_id, Job.status == "running", Job.attempts == claimed_attempt)
+        # A finished attempt holds no lease.
+        .values(lease_expires_at=None, updated_at=func.now())
+        .returning(Job.id)
+    )
