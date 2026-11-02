@@ -108,6 +108,8 @@ async def test_a_submitted_job_is_dispatched_run_once_and_reported_succeeded(
             await worker_connection.close()
 
     assert answers == ["ack"]
+    # `answers` records an answer even when the broker call failed; the worker then logs it.
+    assert "could not ack" not in caplog.text
     assert (status["attempts"], status["max_attempts"]) == (1, api_settings.default_max_attempts)
     row = await job_row(engine, job_id)
     assert row["result"] == {"provider": "fake"}
@@ -118,4 +120,6 @@ async def test_a_submitted_job_is_dispatched_run_once_and_reported_succeeded(
     async with broker_connection.channel() as channel:
         queue_state = await channel.declare_queue(settings.jobs_queue_name, passive=True)
         assert queue_state.declaration_result.message_count == 0
+    # The dispatcher's INFO line shows the capture worked, so the sentinel check is not vacuous.
+    assert "dispatched 1 of 1 due jobs" in caplog.text
     assert SENTINEL not in caplog.text

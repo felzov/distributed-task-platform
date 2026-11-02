@@ -140,9 +140,12 @@ The ADRs refer to these phases by number.
 - The worker reconnects after a broker outage (an 87 s outage was observed once), but aio-pika can
   still end its consumer, after which the worker exits with an error and must be started again.
 - The dispatcher and the worker do not check the database's migration revision when they start.
-  Against an unmigrated database they keep running: the dispatcher logs a failed poll each
-  interval, and the worker backs off and requeues each message until the schema is there, so
-  nothing is lost. A check at start comes with phase 8.
+  Against a database that is unmigrated or behind this code they keep running. Without the `jobs`
+  table every dispatcher poll fails and is logged; with an older schema the dispatcher publishes
+  as usual and the worker's claim fails, so the worker backs off and requeues each message until
+  the schema is there. Nothing is lost. A check at start comes with phase 8.
+- `fake_notifications.job_id` has no index, so looking up a job's notifications (only tests do)
+  scans the table. That is fine for the fake provider; a real provider's records would need one.
 - A worker whose lease expired may still finish its handler. Its result is rejected, but its side
   effect can happen twice, so handlers with side effects must be idempotent (ADR 0001).
 - Recovering a crashed worker's job takes up to the lease duration plus the recovery interval.
@@ -154,6 +157,10 @@ The ADRs refer to these phases by number.
   `OSError` is treated as "database unavailable" (503). Other unexpected errors return 500 and
   uvicorn logs their full traceback for debugging, so a bug whose traceback holds request data
   could still write it to the log.
+- The worker's claim reads the job's payload from PostgreSQL. Nothing logs it at the default log
+  levels, but SQLAlchemy's `sqlalchemy.engine` logger at DEBUG logs result rows, payloads
+  included: `hide_parameters` hides only query parameters. Logging configuration comes with
+  phase 8.
 - uvicorn's access log records each request's raw path and query string, so job IDs, whatever a
   client sent in place of one and anything after a `?` end up in the log. Payloads never do: they
   travel only in request bodies.

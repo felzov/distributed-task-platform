@@ -101,7 +101,10 @@ async def broker_connection(
 
 @pytest.fixture
 def answers(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Each answer the worker gave the broker, in order, once the broker call returned."""
+    """Each answer the worker gave the broker, in order, once `_settle` returned.
+
+    Also when the broker call failed: `_settle` only logs that ("could not ack …").
+    """
     given: list[str] = []
     settle = process._settle
 
