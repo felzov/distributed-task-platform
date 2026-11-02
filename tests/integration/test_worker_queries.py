@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from task_platform.data.fake_notifications import insert_fake_notification
 from task_platform.data.jobs import ClaimedJobRow, claim_job, mark_failed, mark_succeeded
-from task_platform.domain.errors import ErrorCode
+from task_platform.domain.failures import FailureCode
 from tests.integration.rows import insert_job
 
 pytestmark = pytest.mark.integration
@@ -40,7 +40,7 @@ async def succeed(engine: AsyncEngine, job_id: uuid.UUID, attempt: int) -> bool:
 async def fail(engine: AsyncEngine, job_id: uuid.UUID, attempt: int) -> bool:
     async with async_sessionmaker(engine).begin() as session:
         return await mark_failed(
-            session, job_id, claimed_attempt=attempt, error_code=ErrorCode.INVALID_PAYLOAD
+            session, job_id, claimed_attempt=attempt, error_code=FailureCode.INVALID_PAYLOAD
         )
 
 

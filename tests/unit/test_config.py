@@ -239,3 +239,46 @@ def test_non_positive_poll_interval_is_rejected(value: float) -> None:
     # Zero would poll the database in a tight loop.
     with pytest.raises(ValidationError, match="dispatch_poll_interval_s"):
         broker_settings(database_url=URL, broker_url=BROKER_URL, dispatch_poll_interval_s=value)
+
+
+@pytest.mark.parametrize("field", ["lease_duration_s", "handler_timeout_s"])
+@pytest.mark.parametrize("value", [0, -1])
+def test_non_positive_worker_timeouts_are_rejected(field: str, value: float) -> None:
+    with pytest.raises(ValidationError, match=field):
+        broker_settings(database_url=URL, broker_url=BROKER_URL, **{field: value})
+
+
+@pytest.mark.parametrize(
+    ("handler_timeout_s", "accepted"), [(29.999, True), (30.0, False), (45.0, False)]
+)
+def test_handler_timeout_must_be_shorter_than_the_lease(
+    handler_timeout_s: float, accepted: bool
+) -> None:
+    # A handler must not outlive its lease, after which recovery may give the job to another worker.
+    values = {
+        "database_url": URL,
+        "broker_url": BROKER_URL,
+        "lease_duration_s": 30.0,
+        "handler_timeout_s": handler_timeout_s,
+    }
+    if accepted:
+        assert broker_settings(**values).handler_timeout_s == handler_timeout_s
+    else:
+        with pytest.raises(ValidationError, match="handler_timeout_s must be shorter"):
+            broker_settings(**values)
+
+
+@pytest.mark.parametrize(
+    ("lease_duration_s", "accepted"),
+    [(1799.0, True), (1800.0, False), (1e13, False), (float("inf"), False)],
+)
+def test_lease_stays_below_the_brokers_consumer_timeout(
+    lease_duration_s: float, accepted: bool
+) -> None:
+    # ADR 0004 decision 8; inf or a huge lease would also fail every claim in the database.
+    values = {"database_url": URL, "broker_url": BROKER_URL, "lease_duration_s": lease_duration_s}
+    if accepted:
+        assert broker_settings(**values).lease_duration_s == lease_duration_s
+    else:
+        with pytest.raises(ValidationError, match="lease_duration_s"):
+            broker_settings(**values)

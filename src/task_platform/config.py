@@ -77,6 +77,13 @@ class BrokerSettings(Settings):
     # Pause after every poll, so at most dispatch_batch_size jobs go out per interval.
     dispatch_poll_interval_s: float = Field(default=1.0, gt=0)
 
+    # How long a claimed job belongs to its worker; phase 8 recovers jobs whose lease expired.
+    # Below RabbitMQ's default consumer_timeout of 30 minutes (ADR 0004 decision 8); the bound
+    # also rejects inf and values past PostgreSQL's timestamp range, which would fail every claim.
+    lease_duration_s: float = Field(default=120.0, gt=0, lt=1800)
+    # A handler still running after this is cancelled and the job fails as handler_timeout.
+    handler_timeout_s: float = Field(default=60.0, gt=0)
+
     @model_validator(mode="after")
     def _publish_timeout_within_statement_timeout(self) -> Self:
         # A worker's claim waits on the dispatcher's row locks; if the publishes could take longer
@@ -85,6 +92,14 @@ class BrokerSettings(Settings):
         # and the worker use the same DB_STATEMENT_TIMEOUT_MS (one .env for both).
         if self.publish_timeout_s * 1000 >= self.db_statement_timeout_ms:
             raise ValueError("publish_timeout_s must be shorter than db_statement_timeout_ms")
+        return self
+
+    @model_validator(mode="after")
+    def _handler_timeout_within_lease(self) -> Self:
+        # Otherwise a handler could still run after its lease expired, when recovery may already
+        # have given the job to another worker (ADR 0004 decision 8).
+        if self.handler_timeout_s >= self.lease_duration_s:
+            raise ValueError("handler_timeout_s must be shorter than lease_duration_s")
         return self
 
     @field_validator("jobs_queue_name")

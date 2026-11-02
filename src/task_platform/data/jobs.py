@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.dml import ReturningUpdate
 
 from task_platform.data.models import Job
-from task_platform.domain.errors import ErrorCode
+from task_platform.domain.failures import FailureCode
 
 
 async def insert_job(
@@ -146,7 +146,7 @@ async def mark_succeeded(
 
 
 async def mark_failed(
-    session: AsyncSession, job_id: uuid.UUID, *, claimed_attempt: int, error_code: ErrorCode
+    session: AsyncSession, job_id: uuid.UUID, *, claimed_attempt: int, error_code: FailureCode
 ) -> bool:
     """Finish a claimed attempt as `failed`; False if that attempt is no longer current."""
     statement = _fenced_finish(job_id, claimed_attempt).values(
