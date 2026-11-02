@@ -282,3 +282,16 @@ def test_lease_stays_below_the_brokers_consumer_timeout(
     else:
         with pytest.raises(ValidationError, match="lease_duration_s"):
             broker_settings(**values)
+
+
+@pytest.mark.parametrize(
+    ("backoff_s", "accepted"), [(0.001, True), (1799.0, True), (0, False), (1800.0, False)]
+)
+def test_db_error_backoff_bounds(backoff_s: float, accepted: bool) -> None:
+    # The worker holds the message during the wait, so it stays below the consumer_timeout.
+    values = {"database_url": URL, "broker_url": BROKER_URL, "worker_db_error_backoff_s": backoff_s}
+    if accepted:
+        assert broker_settings(**values).worker_db_error_backoff_s == backoff_s
+    else:
+        with pytest.raises(ValidationError, match="worker_db_error_backoff_s"):
+            broker_settings(**values)

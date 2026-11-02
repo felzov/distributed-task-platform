@@ -83,6 +83,10 @@ class BrokerSettings(Settings):
     lease_duration_s: float = Field(default=120.0, gt=0, lt=1800)
     # A handler still running after this is cancelled and the job fails as handler_timeout.
     handler_timeout_s: float = Field(default=60.0, gt=0)
+    # Wait after a database error at the claim, before the message goes back with nack (ADR 0004
+    # decision 6). The worker holds the message unacknowledged meanwhile, for the claim's own
+    # timeouts plus this wait, so it is capped below RabbitMQ's default consumer_timeout (30 min).
+    worker_db_error_backoff_s: float = Field(default=5.0, gt=0, lt=1800)
 
     @model_validator(mode="after")
     def _publish_timeout_within_statement_timeout(self) -> Self:

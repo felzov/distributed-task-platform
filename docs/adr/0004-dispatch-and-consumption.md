@@ -1,6 +1,6 @@
 # ADR 0004 — Dispatch and consumption over RabbitMQ
 
-- **Status:** Accepted
+- **Status:** Accepted (updated 2026-11-02)
 - **Date:** 2026-10-29
 
 ## Context
@@ -80,6 +80,36 @@ with aio-pika 10.2.1 on 2026-10-29, unless marked as taken from the documentatio
    database-error row in decision 6.
 9. Integration tests declare a queue with a unique name per test and delete only that queue
    afterwards. They never purge or delete a queue they did not create.
+
+**Update 2026-11-02 (phase 3, the worker):** points decision 6 left open, settled when the worker
+was built and observed in its integration tests:
+
+- Only an outage gets the claim row's backoff and `nack`. A claim that fails with SQLSTATE class
+  22 (data exception) or 23 (integrity constraint violation) fails the same way on every
+  redelivery, so the worker logs it at ERROR and acks it; the job stays `queued` with
+  `dispatched_at` set until lost-message recovery (phase 8). The class is read from the SQLSTATE,
+  not the exception class, because SQLAlchemy's asyncpg adapter raises a plain `DBAPIError` for
+  class 22 (observed with 22008). Every other database error, a schema mismatch (class 42) and a
+  statement timeout included, counts as an outage.
+- The failure codes in `error_code` are their own set (`domain/failures.py`), apart from the API's
+  error codes, which each map to an HTTP status. A stored payload that fails validation records
+  the code the API would have returned (`invalid_payload`, `unknown_job_type`,
+  `unsupported_payload_version` or `payload_too_large`), and a type without a handler records
+  `unknown_job_type`. A handler that raises records `handler_error`; one still running after
+  `handler_timeout_s` is cancelled and records `handler_timeout`, even if it returns anyway.
+- An unexpected exception while handling a message (a bug, such as a transition the domain
+  refuses) gets `reject(requeue=True)`: the worker keeps consuming, and the message is counted
+  towards the delivery limit (observed through `x-delivery-count`), so it ends like one whose
+  worker keeps crashing instead of looping forever.
+- Prefetch 1 is a constant, not a setting, since decision 5 fixes it. `lease_duration_s` and
+  `worker_db_error_backoff_s` stay below 1800 s, RabbitMQ's default `consumer_timeout` (decision
+  8), and `handler_timeout_s` below the lease.
+- When RabbitMQ cancelled the consumer because its queue was deleted, aio-pika 10.2.1's robust
+  channel declared the queue again and resumed consuming (tested). A cancel for a consumer timeout
+  was not tested. The worker also consumed again after an 87 s broker outage (observed once). If
+  aio-pika ends the consumer anyway, the worker process exits instead of idling.
+- A message whose worker stopped while holding it comes back with `x-delivery-count` 1 (tested
+  with a consumer), as decision 7 says; a redelivery after `nack` carries none.
 
 ## Consequences
 

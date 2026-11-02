@@ -1,7 +1,7 @@
 .RECIPEPREFIX = >
 
 .PHONY: install lint format typecheck test test-integration check check-all run \
-	dispatcher up down db-migrate db-revision
+	dispatcher worker up down db-migrate db-revision
 
 install:
 > uv sync
@@ -37,6 +37,11 @@ run:
 # Publishes due jobs to RabbitMQ until Ctrl-C. Needs .env, `make up` and `make db-migrate`.
 dispatcher:
 > uv run python -m task_platform.dispatcher
+
+# Runs saved jobs from RabbitMQ, one at a time, until Ctrl-C. Needs .env, `make up` and
+# `make db-migrate`; start as many as needed.
+worker:
+> uv run python -m task_platform.worker
 
 # Starts PostgreSQL and RabbitMQ and waits until both healthchecks pass.
 up:

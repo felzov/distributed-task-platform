@@ -6,13 +6,14 @@ retries, so slow work stays out of the request path and every failure is recorde
 
 > **Status: early development (phase 3 of 10).** So far there are the domain rules, a local
 > PostgreSQL with migrations for the `jobs` table (including the lease, error and result columns
-> the worker will write) and the fake provider's `fake_notifications` table, `POST /jobs`
-> (validates and saves a job; 503 when the database is unavailable), `GET /jobs/{id}` (a job's
-> state, never its payload), the `/health` and `/ready` probes, a local RabbitMQ with the
-> connection, queue and confirmed-publish code, the dispatcher process that publishes saved jobs
-> to it (no worker yet, so nothing consumes them), and the development checks (see Development
-> setup). The architecture, MVP scope and roadmap describe the planned design; Known limitations
-> covers both the planned design and the code that exists.
+> the worker writes) and the fake provider's `fake_notifications` table, `POST /jobs` (validates
+> and saves a job; 503 when the database is unavailable), `GET /jobs/{id}` (a job's state, never
+> its payload), the `/health` and `/ready` probes, a local RabbitMQ with the connection, queue and
+> confirmed-publish code, the dispatcher process that publishes saved jobs to it, the worker
+> process that claims each job, runs it against a fake notification provider and records the
+> result (no retries yet: a failed job stays `failed`), and the development checks (see
+> Development setup). The architecture, MVP scope and roadmap describe the planned design; Known
+> limitations covers both the planned design and the code that exists.
 
 ## Planned architecture
 
@@ -115,6 +116,21 @@ The ADRs refer to these phases by number.
 - Ctrl-C stops the dispatcher with a traceback, abandoning the poll in progress: its transaction
   rolls back and those jobs are published again later, so publishes the broker had already
   confirmed become duplicates. Graceful shutdown comes in phase 8.
+- Until retries arrive (phase 5), every handler failure fails the job for good.
+- A claim the database rejects because of the job's own data (SQLSTATE class 22 or 23) is logged
+  at ERROR and its message acked: the job stays `queued`, already dispatched, until lost-message
+  recovery (phase 8). Retrying would fail the same way on every delivery (ADR 0004).
+- Ctrl-C stops the worker with a traceback. The broker requeues the message it held. If the job
+  was already claimed, the redelivery loses the claim, so the job stays `running` until stale-job
+  recovery (phase 8), and its notification may already have been recorded; otherwise the job is
+  claimed normally later.
+- When the final update fails with a database error, the message is requeued, but its redelivery
+  loses the claim: the job stays `running` until stale-job recovery (phase 8).
+- An unexpected error while handling a message (a bug) requeues it with `reject`, which counts:
+  after RabbitMQ's delivery limit (20) the message is dropped, and a job that was never claimed
+  stays `queued`, already dispatched, until lost-message recovery (phase 8).
+- The worker reconnects after a broker outage (an 87 s outage was observed once), but aio-pika can
+  still end its consumer, after which the worker exits with an error and must be started again.
 - A worker whose lease expired may still finish its handler. Its result is rejected, but its side
   effect can happen twice, so handlers with side effects must be idempotent (ADR 0001).
 - Recovering a crashed worker's job takes up to the lease duration plus the recovery interval.
@@ -152,6 +168,7 @@ make up                       # start PostgreSQL (127.0.0.1:5432) and RabbitMQ (
 make db-migrate               # apply migrations to the development database
 make run                      # start the API on 127.0.0.1:8000 (docs at /docs)
 make dispatcher               # publish saved jobs to RabbitMQ until Ctrl-C
+make worker                   # run published jobs, one at a time, until Ctrl-C
 make check                    # lint, format check, mypy --strict, unit tests
 make test-integration         # tests against task_platform_test and the local RabbitMQ
 make check-all                # both of the above
@@ -171,6 +188,10 @@ make down                     # stop both; the data volumes are kept
   database outage only fails polls, and the next poll tries again. It prints nothing while it
   works: until logging is configured (phase 8) only warnings reach stderr, such as a failed poll
   or a poll whose publishes were not confirmed (one line per poll, by error class).
+- The worker also stops at start if RabbitMQ is unreachable or the queue cannot be declared. While
+  the database is down it gives each message back (`nack`) after `WORKER_DB_ERROR_BACKOFF_S`, so
+  no message is lost; its warnings name the job ID and error class, never the payload. Several
+  workers can run at once: the claim lets only one of them run a job.
 - Migrations are written by hand, never autogenerated:
   `make db-revision id=0002 m="what it does"` creates an empty revision to fill in.
 
