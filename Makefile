@@ -1,7 +1,7 @@
 .RECIPEPREFIX = >
 
 .PHONY: install lint format typecheck test test-integration check check-all run \
-	up down db-migrate db-revision
+	dispatcher up down db-migrate db-revision
 
 install:
 > uv sync
@@ -33,6 +33,10 @@ check-all: check test-integration
 # The API on 127.0.0.1:8000. Needs .env, `make up` and `make db-migrate`.
 run:
 > uv run uvicorn task_platform.main:create_app --factory --host 127.0.0.1 --port 8000
+
+# Publishes due jobs to RabbitMQ until Ctrl-C. Needs .env, `make up` and `make db-migrate`.
+dispatcher:
+> uv run python -m task_platform.dispatcher
 
 # Starts PostgreSQL and RabbitMQ and waits until both healthchecks pass.
 up:

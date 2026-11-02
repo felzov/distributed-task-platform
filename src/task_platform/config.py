@@ -74,6 +74,8 @@ class BrokerSettings(Settings):
     dispatch_batch_size: int = Field(default=100, ge=1, le=1000)
     # Bounds all publishes and confirms of one batch together, while the batch's rows stay locked.
     publish_timeout_s: float = Field(default=2.0, gt=0)
+    # Pause after every poll, so at most dispatch_batch_size jobs go out per interval.
+    dispatch_poll_interval_s: float = Field(default=1.0, gt=0)
 
     @model_validator(mode="after")
     def _publish_timeout_within_statement_timeout(self) -> Self:

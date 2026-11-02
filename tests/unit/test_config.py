@@ -226,3 +226,16 @@ def test_publish_timeout_must_be_shorter_than_statement_timeout(
     else:
         with pytest.raises(ValidationError, match="publish_timeout_s must be shorter"):
             broker_settings(**values)
+
+
+def test_poll_interval_is_read_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DISPATCH_POLL_INTERVAL_S", "0.25")
+    result = broker_settings(database_url=URL, broker_url=BROKER_URL)
+    assert result.dispatch_poll_interval_s == 0.25
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_non_positive_poll_interval_is_rejected(value: float) -> None:
+    # Zero would poll the database in a tight loop.
+    with pytest.raises(ValidationError, match="dispatch_poll_interval_s"):
+        broker_settings(database_url=URL, broker_url=BROKER_URL, dispatch_poll_interval_s=value)
