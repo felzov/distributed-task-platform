@@ -80,23 +80,23 @@ async def select_due_job_ids(session: AsyncSession, *, limit: int) -> list[uuid.
     return list(await session.scalars(statement))
 
 
-async def mark_dispatched(session: AsyncSession, job_ids: list[uuid.UUID]) -> int:
-    """Record a confirmed publish for these jobs. Returns how many rows were updated.
+async def mark_dispatched(session: AsyncSession, job_ids: list[uuid.UUID]) -> list[uuid.UUID]:
+    """Record a confirmed publish for these jobs. Returns the ids of the rows updated.
 
     Only jobs that are still `queued` and unpublished are updated, even if a caller passes other
     ids. `available_at` is not checked again: the caller holds the row locks from
     `select_due_job_ids`, so it cannot have changed.
     """
     if not job_ids:
-        return 0
+        return []
     statement = (
         update(Job)
         .where(Job.id.in_(job_ids), Job.status == "queued", Job.dispatched_at.is_(None))
         .values(dispatched_at=func.now(), updated_at=func.now())
-        # RETURNING instead of rowcount, which the typed Result does not expose.
+        # The ids, not a count: the dispatcher names any confirmed job it could not mark.
         .returning(Job.id)
     )
-    return len((await session.scalars(statement)).all())
+    return list(await session.scalars(statement))
 
 
 # attempts (the claimed attempt, used to fence later writes), type, payload_version, payload

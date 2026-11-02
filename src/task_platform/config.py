@@ -69,6 +69,22 @@ class BrokerSettings(Settings):
     # RabbitMQ caps names at 255 bytes; ASCII only here, so that is 255 characters.
     jobs_queue_name: str = Field(default="jobs", max_length=255, pattern=r"^[A-Za-z0-9._-]+$")
 
+    # Jobs one dispatcher poll locks and publishes at once. Capped well below asyncpg's limit of
+    # 32767 bind parameters per statement: marking sends one parameter per id.
+    dispatch_batch_size: int = Field(default=100, ge=1, le=1000)
+    # Bounds all publishes and confirms of one batch together, while the batch's rows stay locked.
+    publish_timeout_s: float = Field(default=2.0, gt=0)
+
+    @model_validator(mode="after")
+    def _publish_timeout_within_statement_timeout(self) -> Self:
+        # A worker's claim waits on the dispatcher's row locks; if the publishes could take longer
+        # than the statement timeout, that claim would time out (ADR 0004 decision 8). The claim
+        # runs under the worker's statement timeout, so this check holds only if the dispatcher
+        # and the worker use the same DB_STATEMENT_TIMEOUT_MS (one .env for both).
+        if self.publish_timeout_s * 1000 >= self.db_statement_timeout_ms:
+            raise ValueError("publish_timeout_s must be shorter than db_statement_timeout_ms")
+        return self
+
     @field_validator("jobs_queue_name")
     @classmethod
     def _not_reserved(cls, name: str) -> str:

@@ -182,3 +182,47 @@ def test_invalid_queue_names_are_rejected(name: str) -> None:
 def test_valid_queue_names_are_accepted(name: str) -> None:
     result = broker_settings(database_url=URL, broker_url=BROKER_URL, jobs_queue_name=name)
     assert result.jobs_queue_name == name
+
+
+def test_dispatch_values_are_read_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DISPATCH_BATCH_SIZE", "7")
+    monkeypatch.setenv("PUBLISH_TIMEOUT_S", "0.5")
+    result = broker_settings(database_url=URL, broker_url=BROKER_URL)
+    assert result.dispatch_batch_size == 7
+    assert result.publish_timeout_s == 0.5
+
+
+@pytest.mark.parametrize(("size", "accepted"), [(0, False), (1, True), (1000, True), (1001, False)])
+def test_dispatch_batch_size_bounds(size: int, accepted: bool) -> None:
+    values = {"database_url": URL, "broker_url": BROKER_URL, "dispatch_batch_size": size}
+    if accepted:
+        assert broker_settings(**values).dispatch_batch_size == size
+    else:
+        with pytest.raises(ValidationError, match="dispatch_batch_size"):
+            broker_settings(**values)
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_non_positive_publish_timeout_is_rejected(value: float) -> None:
+    with pytest.raises(ValidationError, match="publish_timeout_s"):
+        broker_settings(database_url=URL, broker_url=BROKER_URL, publish_timeout_s=value)
+
+
+@pytest.mark.parametrize(
+    ("publish_timeout_s", "accepted"), [(4.999, True), (5.0, False), (9.0, False)]
+)
+def test_publish_timeout_must_be_shorter_than_statement_timeout(
+    publish_timeout_s: float, accepted: bool
+) -> None:
+    # A worker's claim waits on the dispatcher's row locks (ADR 0004 decision 8).
+    values = {
+        "database_url": URL,
+        "broker_url": BROKER_URL,
+        "db_statement_timeout_ms": 5_000,
+        "publish_timeout_s": publish_timeout_s,
+    }
+    if accepted:
+        assert broker_settings(**values).publish_timeout_s == publish_timeout_s
+    else:
+        with pytest.raises(ValidationError, match="publish_timeout_s must be shorter"):
+            broker_settings(**values)

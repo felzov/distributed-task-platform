@@ -61,7 +61,7 @@ async def test_mark_dispatched_records_the_publish(engine: AsyncEngine) -> None:
     job = await insert_job(engine)
 
     async with async_sessionmaker(engine).begin() as session:
-        assert await mark_dispatched(session, [job["id"]]) == 1
+        assert await mark_dispatched(session, [job["id"]]) == [job["id"]]
 
     row = await job_row(engine, job["id"])
     # Both from the same now(), in a later transaction than the insert.
@@ -73,7 +73,7 @@ async def test_mark_dispatched_records_the_publish(engine: AsyncEngine) -> None:
 
 async def test_mark_dispatched_with_no_ids_does_nothing(engine: AsyncEngine) -> None:
     async with async_sessionmaker(engine).begin() as session:
-        assert await mark_dispatched(session, []) == 0
+        assert await mark_dispatched(session, []) == []
 
 
 # Jobs that are not due
@@ -108,7 +108,7 @@ async def test_mark_dispatched_leaves_jobs_that_are_no_longer_due_alone(
     async with async_sessionmaker(engine).begin() as session:
         updated = await mark_dispatched(session, [due["id"], dispatched["id"], running["id"]])
 
-    assert updated == 1
+    assert updated == [due["id"]]
     assert (await job_row(engine, dispatched["id"]))["dispatched_at"] == PAST
     assert (await job_row(engine, running["id"]))["dispatched_at"] is None
 

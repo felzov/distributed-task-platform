@@ -15,6 +15,7 @@ from aiormq import spec
 
 from task_platform.broker.publisher import JobPublisher
 from task_platform.domain.messages import parse_job_message
+from task_platform.services.dispatch import Publisher
 
 TIMEOUT_S = 0.2
 # What publish() returns on a channel with confirms once the broker has taken the message.
@@ -72,6 +73,12 @@ async def test_every_job_gets_one_mandatory_message_to_the_queue() -> None:
 
     assert await publisher(exchange).publish(job_ids) == job_ids
     assert sorted(exchange.calls) == sorted((job_id, "jobs", True) for job_id in job_ids)
+
+
+def test_job_publisher_is_what_the_dispatch_service_takes() -> None:
+    # Checked by mypy: the protocol is structural, so JobPublisher does not name it.
+    service_publisher: Publisher = publisher(FakeExchange())
+    assert isinstance(service_publisher, JobPublisher)
 
 
 async def test_no_jobs_means_no_publish() -> None:
