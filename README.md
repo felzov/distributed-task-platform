@@ -12,10 +12,10 @@ retries, so slow work stays out of the request path and every failure is recorde
 > confirmed-publish code, the dispatcher process that publishes saved jobs to it, the worker
 > process that claims each job, runs it against a fake notification provider and records the
 > result (no retries yet: a failed job stays `failed`), and the development checks (see
-> Development setup). The architecture, MVP scope and roadmap describe the planned design; Known
-> limitations covers both the planned design and the code that exists.
+> Development setup). Architecture says which parts of the design run today; MVP scope and the
+> roadmap describe the planned design; Known limitations covers both.
 
-## Planned architecture
+## Architecture
 
 ```mermaid
 flowchart LR
@@ -27,6 +27,8 @@ flowchart LR
     Worker -->|claim, record result| DB
 ```
 
+The diagram and the bullets describe the design; the last bullet says what runs today.
+
 - The API only writes to PostgreSQL. A `202` response means the job is **saved**, not that it was
   published ([ADR 0002](docs/adr/0002-dual-write-strategy.md)).
 - Messages carry only the job ID. Workers read the job from PostgreSQL.
@@ -34,6 +36,12 @@ flowchart LR
   message cannot claim a job that is already claimed. Each claim holds a lease; jobs of crashed
   workers are recovered when the lease expires, and a stale worker's late result is rejected
   ([ADR 0001](docs/adr/0001-job-lifecycle.md)).
+- **Running today (phase 3):** the API, the dispatcher and the worker run as separate processes
+  (`make run`, `make dispatcher`, `make worker`), with the claim, the lease column and the fenced
+  final update. An integration test takes one job from `POST /jobs` through a dispatcher poll and
+  a worker to `succeeded`. **Not yet:** recovery of expired leases and lost messages (phase 8),
+  retries (phase 5), dead letters (phase 6), and the result and error in `GET /jobs/{id}`
+  (phase 4).
 
 ## MVP scope
 
@@ -62,8 +70,8 @@ flowchart LR
 The ADRs refer to these phases by number.
 
 1. Job contracts, statuses and architecture decisions *(done)*
-2. HTTP API and durable job records *(in progress)*
-3. Dispatcher, RabbitMQ and the first worker
+2. HTTP API and durable job records *(done)*
+3. Dispatcher, RabbitMQ and the first worker *(in progress)*
 4. Status and result endpoints
 5. Retries with exponential backoff and jitter
 6. Dead letters and failure inspection
@@ -131,6 +139,10 @@ The ADRs refer to these phases by number.
   stays `queued`, already dispatched, until lost-message recovery (phase 8).
 - The worker reconnects after a broker outage (an 87 s outage was observed once), but aio-pika can
   still end its consumer, after which the worker exits with an error and must be started again.
+- The dispatcher and the worker do not check the database's migration revision when they start.
+  Against an unmigrated database they keep running: the dispatcher logs a failed poll each
+  interval, and the worker backs off and requeues each message until the schema is there, so
+  nothing is lost. A check at start comes with phase 8.
 - A worker whose lease expired may still finish its handler. Its result is rejected, but its side
   effect can happen twice, so handlers with side effects must be idempotent (ADR 0001).
 - Recovering a crashed worker's job takes up to the lease duration plus the recovery interval.

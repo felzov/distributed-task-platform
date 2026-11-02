@@ -81,8 +81,8 @@ with aio-pika 10.2.1 on 2026-10-29, unless marked as taken from the documentatio
 9. Integration tests declare a queue with a unique name per test and delete only that queue
    afterwards. They never purge or delete a queue they did not create.
 
-**Update 2026-11-02 (phase 3, the worker):** points decision 6 left open, settled when the worker
-was built and observed in its integration tests:
+**Update 2026-11-02 (phase 3, the worker):** what was settled when the worker was built and
+observed in its integration tests:
 
 - Only an outage gets the claim row's backoff and `nack`. A claim that fails with SQLSTATE class
   22 (data exception) or 23 (integrity constraint violation) fails the same way on every
@@ -101,6 +101,11 @@ was built and observed in its integration tests:
   refuses) gets `reject(requeue=True)`: the worker keeps consuming, and the message is counted
   towards the delivery limit (observed through `x-delivery-count`), so it ends like one whose
   worker keeps crashing instead of looping forever.
+- The one handler, `notification.send`, calls a **fake provider**: it records the call as a row in
+  `fake_notifications` (job ID and attempt), committed in its own transaction before the job is
+  finished, as a real provider's call would be. Rows are never deduplicated, so a test can count
+  how often the side effect happened. It is not idempotent yet: ADR 0001 requires idempotent side
+  effects from phase 7, and the duplicate rows are what make the gap visible.
 - Prefetch 1 is a constant, not a setting, since decision 5 fixes it. `lease_duration_s` and
   `worker_db_error_backoff_s` stay below 1800 s, RabbitMQ's default `consumer_timeout` (decision
   8), and `handler_timeout_s` below the lease.

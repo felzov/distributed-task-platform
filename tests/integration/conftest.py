@@ -1,7 +1,7 @@
 """Fixtures for tests against a real PostgreSQL and RabbitMQ (marker `integration`)."""
 
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
 from pathlib import Path
 
 import pytest
@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from task_platform.broker.connection import connect_broker
 from task_platform.config import BrokerSettings, Settings
 from task_platform.data.db import create_db_engine
+from task_platform.worker import process
 from tests.integration.broker import TestBrokerError, load_test_broker_url
 from tests.integration.database import TestDatabaseError, load_test_database_url
 from tests.settings import UNREACHABLE_DATABASE_URL, make_test_broker_settings, make_test_settings
@@ -96,3 +97,17 @@ async def broker_connection(
             await channel.queue_delete(broker_settings.jobs_queue_name)
         finally:
             await connection.close()
+
+
+@pytest.fixture
+def answers(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Each answer the worker gave the broker, in order, once the broker call returned."""
+    given: list[str] = []
+    settle = process._settle
+
+    async def recording_settle(action: str, answer: Awaitable[None]) -> None:
+        await settle(action, answer)
+        given.append(action)
+
+    monkeypatch.setattr(process, "_settle", recording_settle)
+    return given

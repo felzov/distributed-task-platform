@@ -5,7 +5,7 @@ import asyncio
 import json
 import logging
 import uuid
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -54,20 +54,6 @@ def settings(
 @pytest.fixture
 def sessions(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(engine, expire_on_commit=False)
-
-
-@pytest.fixture
-def answers(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Each answer the worker gave the broker, in order, once the broker call returned."""
-    given: list[str] = []
-    settle = process._settle
-
-    async def recording_settle(action: str, answer: Awaitable[None]) -> None:
-        await settle(action, answer)
-        given.append(action)
-
-    monkeypatch.setattr(process, "_settle", recording_settle)
-    return given
 
 
 @pytest.fixture
