@@ -8,6 +8,7 @@ connection, leaves it unpublished, so the dispatcher publishes it again on a lat
 import asyncio
 import logging
 import uuid
+from collections import Counter
 from collections.abc import Sequence
 from typing import Protocol
 
@@ -60,16 +61,27 @@ class JobPublisher:
             await asyncio.gather(*tasks.values(), return_exceptions=True)
 
         confirmed = []
+        reasons: Counter[str] = Counter()
         for job_id, task in tasks.items():
             if task.cancelled():
-                logger.warning("job message not confirmed: job %s, publish timeout", job_id)
+                reason = "publish timeout"
             elif (error := task.exception()) is not None:
                 # The class only: str() of a returned message's error includes the message.
-                logger.warning(
-                    "job message not confirmed: job %s, %s", job_id, safe_logging.class_name(error)
-                )
+                reason = safe_logging.class_name(error)
             else:
                 confirmed.append(job_id)
+                continue
+            reasons[reason] += 1
+            logger.debug("job message not confirmed: job %s, %s", job_id, reason)
+        if reasons:
+            # One line per batch, not per job: during a broker outage every publish of every poll
+            # fails, and the jobs are published again anyway.
+            logger.warning(
+                "job messages not confirmed: %d of %d (%s)",
+                reasons.total(),
+                len(tasks),
+                ", ".join(f"{reason}: {count}" for reason, count in sorted(reasons.items())),
+            )
         return confirmed
 
     async def _publish_one(self, job_id: uuid.UUID) -> None:

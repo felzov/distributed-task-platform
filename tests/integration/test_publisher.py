@@ -55,7 +55,7 @@ async def test_a_message_no_queue_takes_is_not_confirmed(
     job_id = uuid.uuid4()
 
     assert await publisher.publish([job_id]) == []
-    assert f"job {job_id}, aiormq.exceptions.PublishError" in caplog.text
+    assert "job messages not confirmed: 1 of 1 (aiormq.exceptions.PublishError: 1)" in caplog.text
 
 
 async def test_a_message_the_broker_refuses_is_not_confirmed(
@@ -77,7 +77,7 @@ async def test_a_message_the_broker_refuses_is_not_confirmed(
     job_id = uuid.uuid4()
 
     assert await publisher.publish([job_id]) == []
-    assert f"job {job_id}, aiormq.exceptions.DeliveryError" in caplog.text
+    assert "job messages not confirmed: 1 of 1 (aiormq.exceptions.DeliveryError: 1)" in caplog.text
 
 
 async def test_nothing_is_confirmed_over_a_closed_connection(
@@ -95,4 +95,4 @@ async def test_nothing_is_confirmed_over_a_closed_connection(
     assert await publisher.publish([job_id]) == []
     # Fails at once rather than waiting for the timeout.
     assert time.monotonic() - started < TIMEOUT_S
-    assert f"job message not confirmed: job {job_id}," in caplog.text
+    assert "job messages not confirmed: 1 of 1 (" in caplog.text

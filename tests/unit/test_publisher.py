@@ -115,7 +115,10 @@ async def test_a_publish_answered_without_an_ack_is_not_confirmed(
     exchange = FakeExchange(reply=reply)
 
     assert await publisher(exchange).publish([job_id]) == []
-    assert f"job {job_id}, task_platform.broker.publisher.PublishNotAckedError" in caplog.text
+    assert (
+        "job messages not confirmed: 1 of 1"
+        " (task_platform.broker.publisher.PublishNotAckedError: 1)" in caplog.text
+    )
 
 
 async def test_only_confirmed_jobs_are_returned_in_input_order(
@@ -123,14 +126,31 @@ async def test_only_confirmed_jobs_are_returned_in_input_order(
 ) -> None:
     first, failing, silent, last = ids(4)
     exchange = FakeExchange(failing=frozenset({failing}), silent=frozenset({silent}))
+    caplog.set_level(logging.DEBUG, logger="task_platform.broker.publisher")
 
     confirmed = await publisher(exchange).publish([first, failing, silent, last])
 
     assert confirmed == [first, last]
+    # One warning for the batch, counted by reason; each job's id and reason at DEBUG.
+    assert (
+        "job messages not confirmed: 2 of 4"
+        " (publish timeout: 1, tests.unit.test_publisher.BrokerRefusedError: 1)" in caplog.text
+    )
     assert f"job message not confirmed: job {failing}, tests.unit.test_publisher." in caplog.text
     assert f"job message not confirmed: job {silent}, publish timeout" in caplog.text
     # The error's class, never its text.
     assert "would be in here" not in caplog.text
+
+
+async def test_a_failing_batch_logs_one_warning(caplog: pytest.LogCaptureFixture) -> None:
+    # A broker outage fails every publish of every poll: one line per poll, not per job.
+    job_ids = ids(5)
+
+    assert await publisher(FakeExchange(failing=frozenset(job_ids))).publish(job_ids) == []
+    warnings = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert [record.getMessage() for record in warnings] == [
+        "job messages not confirmed: 5 of 5 (tests.unit.test_publisher.BrokerRefusedError: 5)"
+    ]
 
 
 async def test_one_timeout_bounds_the_whole_batch() -> None:
