@@ -65,26 +65,42 @@ async def test_each_submission_creates_its_own_job(
         assert await connection.scalar(text("SELECT count(*) FROM jobs")) == 2
 
 
-# The ORM model and the hand-written migration describe the same table
+# The ORM models and the hand-written migrations describe the same tables
 
 
-async def test_orm_model_matches_the_migrated_table(engine: AsyncEngine) -> None:
+# Per table: {column: (DDL type, nullable)} and the primary key columns.
+TableDescriptions = dict[str, tuple[dict[str, tuple[str, bool]], list[str]]]
+
+
+async def test_orm_models_match_the_migrated_tables(engine: AsyncEngine) -> None:
     # Types compared as the DDL PostgreSQL would get, e.g. "TIMESTAMP WITH TIME ZONE".
-    def describe(connection: Connection) -> tuple[dict[str, tuple[str, bool]], list[str]]:
+    def describe(connection: Connection) -> TableDescriptions:
         inspector = inspect(connection)
-        columns = {
-            column["name"]: (column["type"].compile(connection.dialect), column["nullable"])
-            for column in inspector.get_columns("jobs")
+        return {
+            table: (
+                {
+                    column["name"]: (column["type"].compile(connection.dialect), column["nullable"])
+                    for column in inspector.get_columns(table)
+                },
+                inspector.get_pk_constraint(table)["constrained_columns"],
+            )
+            for table in inspector.get_table_names()
+            if table != "alembic_version"
         }
-        return columns, inspector.get_pk_constraint("jobs")["constrained_columns"]
 
     async with engine.connect() as connection:
-        db_columns, db_primary_key = await connection.run_sync(describe)
+        db_tables = await connection.run_sync(describe)
         dialect = connection.dialect
 
-    table = Base.metadata.tables["jobs"]
-    model_columns = {
-        column.name: (column.type.compile(dialect), column.nullable) for column in table.columns
+    model_tables = {
+        name: (
+            {
+                column.name: (column.type.compile(dialect), column.nullable)
+                for column in table.columns
+            },
+            [column.name for column in table.primary_key],
+        )
+        for name, table in Base.metadata.tables.items()
     }
-    assert model_columns == db_columns
-    assert [column.name for column in table.primary_key] == db_primary_key
+    # Also catches a table that only one side knows about.
+    assert model_tables == db_tables

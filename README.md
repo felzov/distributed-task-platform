@@ -4,14 +4,18 @@ A background-job system built to make failure behaviour explicit: an HTTP API sa
 PostgreSQL, a dispatcher publishes them to RabbitMQ, and separate workers run them with bounded
 retries, so slow work stays out of the request path and every failure is recorded.
 
-> **Status: early development (phase 2 of 10).** So far there are the domain rules, a local
-> PostgreSQL with the `jobs` table migration, `POST /jobs` (validates and saves a job; 503 when
-> the database is unavailable), `GET /jobs/{id}` (a job's state, never its payload), the `/health`
-> and `/ready` probes, and the development checks (see Development setup). The architecture,
-> MVP scope and roadmap describe the planned design; Known limitations covers both the planned
-> design and the code that exists.
+> **Status: early development (phase 3 of 10).** So far there are the domain rules, a local
+> PostgreSQL with migrations for the `jobs` table (including the lease, error and result columns
+> the worker writes) and the fake provider's `fake_notifications` table, `POST /jobs` (validates
+> and saves a job; 503 when the database is unavailable), `GET /jobs/{id}` (a job's state, never
+> its payload), the `/health` and `/ready` probes, a local RabbitMQ with the connection, queue and
+> confirmed-publish code, the dispatcher process that publishes saved jobs to it, the worker
+> process that claims each job, runs it against a fake notification provider and records the
+> result (no retries yet: a failed job stays `failed`), and the development checks (see
+> Development setup). Architecture says which parts of the design run today; MVP scope and the
+> roadmap describe the planned design; Known limitations covers both.
 
-## Planned architecture
+## Architecture
 
 ```mermaid
 flowchart LR
@@ -23,6 +27,8 @@ flowchart LR
     Worker -->|claim, record result| DB
 ```
 
+The diagram and the bullets describe the design; the last bullet says what runs today.
+
 - The API only writes to PostgreSQL. A `202` response means the job is **saved**, not that it was
   published ([ADR 0002](docs/adr/0002-dual-write-strategy.md)).
 - Messages carry only the job ID. Workers read the job from PostgreSQL.
@@ -30,6 +36,12 @@ flowchart LR
   message cannot claim a job that is already claimed. Each claim holds a lease; jobs of crashed
   workers are recovered when the lease expires, and a stale worker's late result is rejected
   ([ADR 0001](docs/adr/0001-job-lifecycle.md)).
+- **Running today (phase 3):** the API, the dispatcher and the worker run as separate processes
+  (`make run`, `make dispatcher`, `make worker`), with the claim, the lease column and the fenced
+  final update. An integration test takes one job from `POST /jobs` through a dispatcher poll and
+  a worker to `succeeded`. **Not yet:** recovery of expired leases and lost messages (phase 8),
+  retries (phase 5), dead letters (phase 6), and the result and error in `GET /jobs/{id}`
+  (phase 4).
 
 ## MVP scope
 
@@ -58,8 +70,8 @@ flowchart LR
 The ADRs refer to these phases by number.
 
 1. Job contracts, statuses and architecture decisions *(done)*
-2. HTTP API and durable job records *(in progress)*
-3. Dispatcher, RabbitMQ and the first worker
+2. HTTP API and durable job records *(done)*
+3. Dispatcher, RabbitMQ and the first worker *(in progress)*
 4. Status and result endpoints
 5. Retries with exponential backoff and jitter
 6. Dead letters and failure inspection
@@ -75,6 +87,7 @@ The ADRs refer to these phases by number.
 | [0001](docs/adr/0001-job-lifecycle.md) | Four job statuses; attempts counted when a worker claims a job |
 | [0002](docs/adr/0002-dual-write-strategy.md) | The jobs table is the outbox; a dispatcher publishes due jobs |
 | [0003](docs/adr/0003-async-io-stack.md) | asyncio throughout: SQLAlchemy asyncio, asyncpg, aio-pika |
+| [0004](docs/adr/0004-dispatch-and-consumption.md) | One quorum queue; the worker acks, nacks or rejects per outcome |
 
 ## Health and readiness probes
 
@@ -97,10 +110,42 @@ The ADRs refer to these phases by number.
 - **No authentication.** Anyone who can reach the API can submit jobs, which means triggering
   notifications, and anyone who knows a job ID can read that job's status. Run it only on a trusted
   network. The same goes for `/ready`: it tells anyone who can reach it whether the database is
-  behind on migrations.
+  at this code's migration revision.
 - A worker crash uses up one of the job's attempts, even when the crash had nothing to do with the
   job (ADR 0001).
-- Dispatch latency is up to one dispatcher poll interval (ADR 0002).
+- Dispatch latency is up to one dispatcher poll interval plus one poll (ADR 0002) while fewer than
+  `DISPATCH_BATCH_SIZE` jobs are due. The dispatcher pauses after every poll, even a full one, so
+  it publishes at most `DISPATCH_BATCH_SIZE` jobs per `DISPATCH_POLL_INTERVAL_S` (100 per second
+  with the defaults) and a backlog of N batches waits about N intervals. A database error during
+  a poll turns that poll's confirmed publishes into duplicates, which the worker's claim absorbs.
+- The dispatcher declares the jobs queue only when it starts. If the queue is deleted while it
+  runs, the broker returns every message and the jobs stay saved, unpublished, until a process
+  declares the queue again.
+- Ctrl-C stops the dispatcher with a traceback, abandoning the poll in progress: its transaction
+  rolls back and those jobs are published again later, so publishes the broker had already
+  confirmed become duplicates. Graceful shutdown comes in phase 8.
+- Until retries arrive (phase 5), every handler failure fails the job for good.
+- A claim the database rejects because of the job's own data (SQLSTATE class 22 or 23) is logged
+  at ERROR and its message acked: the job stays `queued`, already dispatched, until lost-message
+  recovery (phase 8). Retrying would fail the same way on every delivery (ADR 0004).
+- Ctrl-C stops the worker with a traceback. The broker requeues the message it held. If the job
+  was already claimed, the redelivery loses the claim, so the job stays `running` until stale-job
+  recovery (phase 8), and its notification may already have been recorded; otherwise the job is
+  claimed normally later.
+- When the final update fails with a database error, the message is requeued, but its redelivery
+  loses the claim: the job stays `running` until stale-job recovery (phase 8).
+- An unexpected error while handling a message (a bug) requeues it with `reject`, which counts:
+  after RabbitMQ's delivery limit (20) the message is dropped, and a job that was never claimed
+  stays `queued`, already dispatched, until lost-message recovery (phase 8).
+- The worker reconnects after a broker outage (an 87 s outage was observed once), but aio-pika can
+  still end its consumer, after which the worker exits with an error and must be started again.
+- The dispatcher and the worker do not check the database's migration revision when they start.
+  Against a database that is unmigrated or behind this code they keep running. Without the `jobs`
+  table every dispatcher poll fails and is logged; with an older schema the dispatcher publishes
+  as usual and the worker's claim fails, so the worker backs off and requeues each message until
+  the schema is there. Nothing is lost. A check at start comes with phase 8.
+- `fake_notifications.job_id` has no index, so looking up a job's notifications (only tests do)
+  scans the table. That is fine for the fake provider; a real provider's records would need one.
 - A worker whose lease expired may still finish its handler. Its result is rejected, but its side
   effect can happen twice, so handlers with side effects must be idempotent (ADR 0001).
 - Recovering a crashed worker's job takes up to the lease duration plus the recovery interval.
@@ -112,8 +157,13 @@ The ADRs refer to these phases by number.
   `OSError` is treated as "database unavailable" (503). Other unexpected errors return 500 and
   uvicorn logs their full traceback for debugging, so a bug whose traceback holds request data
   could still write it to the log.
-- uvicorn's access log records each request's raw path, so job IDs, and whatever a client sent in
-  place of one, end up in the log. Payloads never do: they travel only in request bodies.
+- The worker's claim reads the job's payload from PostgreSQL. Nothing logs it at the default log
+  levels, but SQLAlchemy's `sqlalchemy.engine` logger at DEBUG logs result rows, payloads
+  included: `hide_parameters` hides only query parameters. Logging configuration comes with
+  phase 8.
+- uvicorn's access log records each request's raw path and query string, so job IDs, whatever a
+  client sent in place of one and anything after a `?` end up in the log. Payloads never do: they
+  travel only in request bodies.
 - `/ready` requires the database revision to equal the code's exactly. During a rolling deploy,
   instances running the old code report not ready as soon as the new migration is applied. The MVP
   runs one instance and migrates before starting it.
@@ -133,23 +183,36 @@ Python (3.12, see `.python-version`) if it is missing.
 make install                  # create .venv and install locked dependencies
 uv run pre-commit install     # run lint, format, mypy and secret checks on every commit
 cp .env.example .env          # then replace every change-me with a local password
-make db-up                    # start PostgreSQL on 127.0.0.1:5432 and wait until it is healthy
+make up                       # start PostgreSQL (127.0.0.1:5432) and RabbitMQ (127.0.0.1:5672)
 make db-migrate               # apply migrations to the development database
 make run                      # start the API on 127.0.0.1:8000 (docs at /docs)
+make dispatcher               # publish saved jobs to RabbitMQ until Ctrl-C
+make worker                   # run published jobs, one at a time, until Ctrl-C
 make check                    # lint, format check, mypy --strict, unit tests
-make test-integration         # tests against the task_platform_test database
+make test-integration         # tests against task_platform_test and the local RabbitMQ
 make check-all                # both of the above
 make format                   # apply ruff formatting and safe lint fixes
-make db-down                  # stop PostgreSQL; the data volume is kept
+make down                     # stop both; the data volumes are kept
 ```
 
-- The password in `.env` is applied only when the PostgreSQL volume is first created, and the
-  `task_platform_test` database is created at the same moment. Changing either later requires
-  recreating the volume (`docker compose down -v`, which deletes all local data).
-- Integration tests fail, rather than skip, when `TEST_DATABASE_URL` is missing, and refuse any
-  database whose name does not end in `_test`.
+- The passwords in `.env` are applied only when each container's volume is first created, and
+  the `task_platform_test` database is created at the same moment. Changing them later requires
+  recreating the volumes (`docker compose down -v`, which deletes all local data).
+- `make up` waits until both healthchecks pass: PostgreSQL accepts connections and RabbitMQ's
+  AMQP listener is up.
+- Integration tests fail, rather than skip, when `TEST_DATABASE_URL` or `TEST_BROKER_URL` is
+  missing, and refuse any database whose name does not end in `_test`. Broker tests declare
+  queues with unique names and delete only those, so they can share the local RabbitMQ.
+- The dispatcher stops at start if RabbitMQ is unreachable or the jobs queue cannot be declared; a
+  database outage only fails polls, and the next poll tries again. It prints nothing while it
+  works: until logging is configured (phase 8) only warnings reach stderr, such as a failed poll
+  or a poll whose publishes were not confirmed (one line per poll, by error class).
+- The worker also stops at start if RabbitMQ is unreachable or the queue cannot be declared. While
+  the database is down it gives each message back (`nack`) after `WORKER_DB_ERROR_BACKOFF_S`, so
+  no message is lost; its warnings name the job ID and error class, never the payload. Several
+  workers can run at once: the claim lets only one of them run a job.
 - Migrations are written by hand, never autogenerated:
   `make db-revision id=0002 m="what it does"` creates an empty revision to fill in.
 
-CI runs `make check` and the integration tests against a PostgreSQL service container on Python
-3.12 and 3.14, and scans the full git history for secrets with gitleaks.
+CI runs `make check` and the integration tests against PostgreSQL and RabbitMQ service containers
+on Python 3.12 and 3.14, and scans the full git history for secrets with gitleaks.

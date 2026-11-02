@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 # The newest revision in migrations/versions/. Bump it with every new migration; a unit test
 # checks that it equals Alembic's head.
-SCHEMA_REVISION: Final = "0001"
+SCHEMA_REVISION: Final = "0002"
 
 
 async def current_revisions(connection: AsyncConnection) -> tuple[str, ...]:

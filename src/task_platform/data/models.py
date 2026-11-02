@@ -34,3 +34,19 @@ class Job(Base):
     dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # Added by migration 0002.
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(Text)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+
+
+class FakeNotification(Base):
+    """One call to the fake notification provider (ADR 0004); duplicates are kept on purpose."""
+
+    __tablename__ = "fake_notifications"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, server_default=FetchedValue())
+    # The foreign key lives in migration 0002, like every other constraint.
+    job_id: Mapped[uuid.UUID]
+    attempt: Mapped[int]
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

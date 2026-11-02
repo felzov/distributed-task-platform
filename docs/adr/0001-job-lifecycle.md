@@ -1,6 +1,6 @@
 # ADR 0001 — Job lifecycle and state transitions
 
-- **Status:** Accepted
+- **Status:** Accepted (updated 2026-10-29)
 - **Date:** 2026-10-24
 
 ## Context
@@ -69,6 +69,10 @@ Two questions shape the design:
 9. All job timestamps (`available_at`, `lease_expires_at`, `created_at`, `updated_at`) are computed
    by PostgreSQL (`now()`, `now() + interval`), never from a worker's or the API's clock, so clock
    drift between machines cannot shift retries or leases.
+
+**Update 2026-10-29 (phase 3):** the open point in decision 7 is closed by ADR 0004. When the claim
+fails with a database error, the worker waits a configured backoff and then returns the message with
+`nack(requeue=True)`, which does not count towards RabbitMQ's delivery limit.
 
 ## Consequences
 
