@@ -10,6 +10,7 @@ from sqlalchemy.sql.dml import ReturningUpdate
 
 from task_platform.data.models import Job
 from task_platform.domain.failures import FailureCode
+from task_platform.domain.job_status import JobStatus
 
 
 async def insert_job(
@@ -84,7 +85,7 @@ async def select_due_job_ids(session: AsyncSession, *, limit: int) -> list[uuid.
     statement = (
         select(Job.id)
         .where(
-            Job.status == "queued",
+            Job.status == JobStatus.QUEUED,
             Job.dispatched_at.is_(None),
             Job.available_at <= func.now(),
         )
@@ -106,7 +107,7 @@ async def mark_dispatched(session: AsyncSession, job_ids: list[uuid.UUID]) -> li
         return []
     statement = (
         update(Job)
-        .where(Job.id.in_(job_ids), Job.status == "queued", Job.dispatched_at.is_(None))
+        .where(Job.id.in_(job_ids), Job.status == JobStatus.QUEUED, Job.dispatched_at.is_(None))
         .values(dispatched_at=func.now(), updated_at=func.now())
         # The ids, not a count: the dispatcher names any confirmed job it could not mark.
         .returning(Job.id)
@@ -133,14 +134,14 @@ async def claim_job(
         update(Job)
         .where(
             Job.id == job_id,
-            Job.status == "queued",
+            Job.status == JobStatus.QUEUED,
             Job.available_at <= func.now(),
             # Retries and recovery requeue only below the budget (ADR 0001); the database does not
             # enforce that for queued rows, and a CHECK error here would look like a DB outage.
             Job.attempts < Job.max_attempts,
         )
         .values(
-            status="running",
+            status=JobStatus.RUNNING,
             attempts=Job.attempts + 1,
             # A duration from the caller, a timestamp from PostgreSQL's clock (ADR 0001 decision 9).
             lease_expires_at=func.now() + timedelta(seconds=lease_duration_s),
@@ -156,7 +157,9 @@ async def mark_succeeded(
     session: AsyncSession, job_id: uuid.UUID, *, claimed_attempt: int, result: dict[str, Any]
 ) -> bool:
     """Finish a claimed attempt as `succeeded`; False if that attempt is no longer current."""
-    statement = _fenced_finish(job_id, claimed_attempt).values(status="succeeded", result=result)
+    statement = _fenced_finish(job_id, claimed_attempt).values(
+        status=JobStatus.SUCCEEDED, result=result
+    )
     return (await session.scalar(statement)) is not None
 
 
@@ -165,7 +168,7 @@ async def mark_failed(
 ) -> bool:
     """Finish a claimed attempt as `failed`; False if that attempt is no longer current."""
     statement = _fenced_finish(job_id, claimed_attempt).values(
-        status="failed", error_code=error_code
+        status=JobStatus.FAILED, error_code=error_code
     )
     return (await session.scalar(statement)) is not None
 
@@ -176,7 +179,7 @@ def _fenced_finish(job_id: uuid.UUID, claimed_attempt: int) -> ReturningUpdate[t
     # columns; UPDATE merges repeated .values().
     return (
         update(Job)
-        .where(Job.id == job_id, Job.status == "running", Job.attempts == claimed_attempt)
+        .where(Job.id == job_id, Job.status == JobStatus.RUNNING, Job.attempts == claimed_attempt)
         # A finished attempt holds no lease.
         .values(lease_expires_at=None, updated_at=func.now())
         .returning(Job.id)

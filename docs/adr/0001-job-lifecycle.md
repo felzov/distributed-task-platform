@@ -1,6 +1,6 @@
 # ADR 0001 — Job lifecycle and state transitions
 
-- **Status:** Accepted (updated 2026-10-29)
+- **Status:** Accepted (updated 2026-11-03)
 - **Date:** 2026-10-24
 
 ## Context
@@ -74,6 +74,17 @@ Two questions shape the design:
 fails with a database error, the worker waits a configured backoff and then returns the message with
 `nack(requeue=True)`, which does not count towards RabbitMQ's delivery limit.
 
+**Update 2026-11-03 (phase 4):** decisions 6 and 7 describe one rule twice, as the domain's table
+and as the SQL conditions in `data/jobs.py`. A test now checks that they agree: every write that
+changes an existing job (the claim, recording a publish, and the two fenced finishes) runs against
+a job in each of the four statuses, with every other condition met. Each write either applies
+where expected, moving the job to the expected status along an allowed transition, or leaves the
+row exactly as it was. Only recording a publish may change a row without changing its status; any
+other write that does, such as re-claiming a `running` job, counts as a violation. Removing a
+write's status condition, or making it write the wrong target status, made the test fail (checked
+once by editing the code). The conditions use the domain's `JobStatus` values instead of string
+literals.
+
 ## Consequences
 
 - Four statuses give 16 `(from, to)` pairs, so the whole table can be covered by one parametrised
@@ -115,3 +126,8 @@ fails with a database error, the worker waits a configured backoff and then retu
 - **A separate `dispatched` status.** Whether a message has been published is transport state, not
   job state; it is tracked by `dispatched_at` instead (ADR 0002). Rejected.
 - **A PostgreSQL `ENUM` for `status`.** Rejected for the migration reasons in decision 1.
+- **A database trigger that enforces the transition table** (considered in phase 4). It would
+  reject an invalid transition from any writer, including manual SQL, but it is a second copy of
+  the table in SQL that must be changed together with the domain's, against decision 6. The
+  conditional updates already apply each transition atomically, and the test above checks them
+  against the table. Rejected.
