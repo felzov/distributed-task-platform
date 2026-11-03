@@ -59,7 +59,8 @@ class ClaimedJob:
     attempt: int
 
 
-# A handler returns the job's result, a small JSON object. It may open its own transactions.
+# A handler returns the job's result, a small JSON object. It may open its own transactions. The
+# result is shown to clients by `GET /jobs/{id}`, so it must never copy the payload.
 Handler = Callable[
     [async_sessionmaker[AsyncSession], ClaimedJob, PayloadModel], Awaitable[dict[str, Any]]
 ]

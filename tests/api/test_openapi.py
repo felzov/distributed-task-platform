@@ -67,3 +67,26 @@ async def test_probes_document_their_exact_status() -> None:
         ref = spec["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
         name = ref["schema"]["$ref"].rsplit("/", 1)[-1]
         assert spec["components"]["schemas"][name]["properties"]["status"]["const"] == value
+
+
+async def test_job_response_documents_result_and_failure() -> None:
+    app = create_app(make_test_settings(UNREACHABLE_DATABASE_URL))
+    try:
+        spec = app.openapi()
+    finally:
+        await app.state.engine.dispose()
+
+    schemas = spec["components"]["schemas"]
+    ok = spec["paths"]["/jobs/{job_id}"]["get"]["responses"]["200"]["content"]["application/json"]
+    assert ok["schema"] == {"$ref": "#/components/schemas/JobResponse"}
+    job = schemas["JobResponse"]
+    assert {"result", "failure"} <= set(job["required"])
+    assert job["properties"]["result"]["anyOf"] == [
+        {"type": "object", "additionalProperties": True},
+        {"type": "null"},
+    ]
+    assert job["properties"]["failure"]["anyOf"] == [
+        {"$ref": "#/components/schemas/FailureBody"},
+        {"type": "null"},
+    ]
+    assert set(schemas["FailureBody"]["required"]) == {"code", "message"}

@@ -36,8 +36,21 @@ async def insert_job(
     return row.id, row.status
 
 
-# id, type, payload_version, status, attempts, max_attempts, available_at, created_at, updated_at
-JobStateRow = Row[uuid.UUID, str, int, str, int, int, datetime, datetime, datetime]
+# id, type, payload_version, status, attempts, max_attempts, available_at, created_at, updated_at,
+# error_code, result
+JobStateRow = Row[
+    uuid.UUID,
+    str,
+    int,
+    str,
+    int,
+    int,
+    datetime,
+    datetime,
+    datetime,
+    str | None,
+    dict[str, Any] | None,
+]
 
 
 async def select_job(session: AsyncSession, job_id: uuid.UUID) -> JobStateRow | None:
@@ -54,6 +67,8 @@ async def select_job(session: AsyncSession, job_id: uuid.UUID) -> JobStateRow | 
         Job.available_at,
         Job.created_at,
         Job.updated_at,
+        Job.error_code,
+        Job.result,
     ).where(Job.id == job_id)
     return (await session.execute(statement)).one_or_none()
 
