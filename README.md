@@ -71,7 +71,7 @@ The ADRs refer to these phases by number.
 1. Job contracts, statuses and architecture decisions *(done)*
 2. HTTP API and durable job records *(done)*
 3. Dispatcher, RabbitMQ and the first worker *(done)*
-4. Status and result endpoints *(in progress)*
+4. Status and result endpoints *(done)*
 5. Retries with exponential backoff and jitter
 6. Dead letters and failure inspection
 7. Idempotency for submission and side effects
