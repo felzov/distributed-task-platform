@@ -4,9 +4,10 @@ The domain's table (`ALLOWED_TRANSITIONS`, ADR 0001 decision 6) and the SQL cond
 layer are two descriptions of one rule. This matrix runs each write on each status: a write either
 applies, moving the job only where the table allows, or leaves the row exactly as it was. Staying
 in the same status is not a transition (ADR 0001 decision 2), so a re-claim of a running job or a
-rewrite of a finished one counts as a violation even though the status does not change. Each row
-passes every other condition of the writes (due, attempts left, not yet published, the claimed
-attempt), so only the status decides.
+rewrite of a finished one counts as a violation even though the status does not change. Every row
+is the same apart from its status and passes every other condition of the writes (due, attempts
+left, not yet published, the claimed attempt, a lease), so only the status decides. Some rows are
+therefore ones the code never writes, such as a queued job with a lease.
 """
 
 import uuid
@@ -77,9 +78,12 @@ async def seed(engine: AsyncEngine, status: JobStatus) -> uuid.UUID:
         "status": status,
         "attempts": ATTEMPT,
         "available_at": PAST,
+        # The schema requires a lease only for running, but every row gets one, so a finish fenced
+        # by the lease instead of the status fails here.
+        "lease_expires_at": FUTURE,
+        # dispatched_at stays NULL on every row, finished ones too, so only mark_dispatched's status
+        # condition can refuse them. A realistic published row would hide that condition.
     }
-    if status is JobStatus.RUNNING:
-        columns["lease_expires_at"] = FUTURE
     return uuid.UUID(str((await insert_job(engine, **columns))["id"]))
 
 
