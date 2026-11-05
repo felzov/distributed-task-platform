@@ -40,6 +40,8 @@ async def test_migrations_go_up_down_and_up_again(test_settings: Settings) -> No
         "ix_jobs_dispatch_due",
         "fake_notifications",
         "pk_fake_notifications",
+        "job_attempts",
+        "pk_job_attempts",
     }
 
     await migrate(test_settings, "up", "head")
@@ -128,4 +130,49 @@ async def test_existing_jobs_survive_0002_and_its_downgrade(
             )
     finally:
         # Shared test database: leave it at head, as the test above does.
+        await migrate(test_settings, "up", "head")
+
+
+async def test_existing_jobs_survive_0003_and_its_downgrade(
+    engine: AsyncEngine, test_settings: Settings
+) -> None:
+    # ADR 0005 decision 7: no backfill. A job that already ran keeps its attempts count but gets no
+    # attempt rows; the downgrade drops the history and keeps the job.
+    try:
+        await migrate(test_settings, "down", "0002")
+        assert "job_attempts" not in await schema_objects(test_settings)
+        async with engine.begin() as connection:
+            job_id = await connection.scalar(
+                text(
+                    "INSERT INTO jobs (type, payload_version, payload, max_attempts, status,"
+                    " attempts, result) VALUES ('notification.send', 1, '{}', 5, 'succeeded', 2,"
+                    " '{}') RETURNING id"
+                )
+            )
+
+        await migrate(test_settings, "up", "0003")
+        async with engine.begin() as connection:
+            job = (
+                await connection.execute(
+                    text("SELECT status, attempts FROM jobs WHERE id = :id"), {"id": job_id}
+                )
+            ).one()
+            rows = await connection.scalar(
+                text("SELECT count(*) FROM job_attempts WHERE job_id = :id"), {"id": job_id}
+            )
+            assert (tuple(job), rows) == (("succeeded", 2), 0)
+            # A later attempt row, so the downgrade has history to drop.
+            await connection.execute(
+                text("INSERT INTO job_attempts (job_id, attempt) VALUES (:id, 3)"), {"id": job_id}
+            )
+
+        await migrate(test_settings, "down", "0002")
+        assert "job_attempts" not in await schema_objects(test_settings)
+        async with engine.connect() as connection:
+            status = await connection.scalar(
+                text("SELECT status FROM jobs WHERE id = :id"), {"id": job_id}
+            )
+        assert status == "succeeded"
+    finally:
+        # Shared test database: leave it at head, as the tests above do.
         await migrate(test_settings, "up", "head")
