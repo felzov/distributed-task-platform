@@ -111,8 +111,9 @@ async def test_a_submitted_job_is_dispatched_run_once_and_reported_succeeded(
     # `answers` records an answer even when the broker call failed; the worker then logs it.
     assert "could not ack" not in caplog.text
     assert (status["attempts"], status["max_attempts"]) == (1, api_settings.default_max_attempts)
+    # The client sees the handler's result through the API.
+    assert (status["result"], status["failure"]) == ({"provider": "fake"}, None)
     row = await job_row(engine, job_id)
-    assert row["result"] == {"provider": "fake"}
     assert (row["error_code"], row["lease_expires_at"]) == (None, None)
     # The fake provider was called exactly once.
     assert await notification_attempts(engine, job_id) == [1]

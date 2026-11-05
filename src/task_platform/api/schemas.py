@@ -26,6 +26,16 @@ class SubmitJobResponse(BaseModel):
     status: JobStatus
 
 
+class FailureBody(BaseModel):
+    """Why a failed job failed. Named `failure`, not `error`: `error` marks an HTTP error body."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    code: str
+    # A fixed sentence per code; never exception text or input.
+    message: str
+
+
 class JobResponse(BaseModel):
     """Body of `GET /jobs/{id}`. Never the payload: it can hold personal data (e.g. a recipient)."""
 
@@ -40,6 +50,10 @@ class JobResponse(BaseModel):
     available_at: datetime
     created_at: datetime
     updated_at: datetime
+    # Set only for a succeeded job: what its handler returned.
+    result: dict[str, Any] | None
+    # Set only for a failed job.
+    failure: FailureBody | None
 
 
 class ErrorBody(BaseModel):

@@ -4,16 +4,16 @@ A background-job system built to make failure behaviour explicit: an HTTP API sa
 PostgreSQL, a dispatcher publishes them to RabbitMQ, and separate workers run them with bounded
 retries, so slow work stays out of the request path and every failure is recorded.
 
-> **Status: early development (phase 3 of 10).** So far there are the domain rules, a local
+> **Status: early development (phase 4 of 10).** So far there are the domain rules, a local
 > PostgreSQL with migrations for the `jobs` table (including the lease, error and result columns
 > the worker writes) and the fake provider's `fake_notifications` table, `POST /jobs` (validates
-> and saves a job; 503 when the database is unavailable), `GET /jobs/{id}` (a job's state, never
-> its payload), the `/health` and `/ready` probes, a local RabbitMQ with the connection, queue and
-> confirmed-publish code, the dispatcher process that publishes saved jobs to it, the worker
-> process that claims each job, runs it against a fake notification provider and records the
-> result (no retries yet: a failed job stays `failed`), and the development checks (see
-> Development setup). Architecture says which parts of the design run today; MVP scope and the
-> roadmap describe the planned design; Known limitations covers both.
+> and saves a job; 503 when the database is unavailable), `GET /jobs/{id}` (a job's state, result
+> or failure, never its payload), the `/health` and `/ready` probes, a local RabbitMQ with the
+> connection, queue and confirmed-publish code, the dispatcher process that publishes saved jobs
+> to it, the worker process that claims each job, runs it against a fake notification provider
+> and records the result (no retries yet: a failed job stays `failed`), and the development
+> checks (see Development setup). Architecture says which parts of the design run today; MVP
+> scope and the roadmap describe the planned design; Known limitations covers both.
 
 ## Architecture
 
@@ -36,12 +36,11 @@ The diagram and the bullets describe the design; the last bullet says what runs 
   message cannot claim a job that is already claimed. Each claim holds a lease; jobs of crashed
   workers are recovered when the lease expires, and a stale worker's late result is rejected
   ([ADR 0001](docs/adr/0001-job-lifecycle.md)).
-- **Running today (phase 3):** the API, the dispatcher and the worker run as separate processes
+- **Running today (phase 4):** the API, the dispatcher and the worker run as separate processes
   (`make run`, `make dispatcher`, `make worker`), with the claim, the lease column and the fenced
   final update. An integration test takes one job from `POST /jobs` through a dispatcher poll and
   a worker to `succeeded`. **Not yet:** recovery of expired leases and lost messages (phase 8),
-  retries (phase 5), dead letters (phase 6), and the result and error in `GET /jobs/{id}`
-  (phase 4).
+  retries (phase 5) and dead letters (phase 6).
 
 ## MVP scope
 
@@ -71,8 +70,8 @@ The ADRs refer to these phases by number.
 
 1. Job contracts, statuses and architecture decisions *(done)*
 2. HTTP API and durable job records *(done)*
-3. Dispatcher, RabbitMQ and the first worker *(in progress)*
-4. Status and result endpoints
+3. Dispatcher, RabbitMQ and the first worker *(done)*
+4. Status and result endpoints *(done)*
 5. Retries with exponential backoff and jitter
 6. Dead letters and failure inspection
 7. Idempotency for submission and side effects
@@ -88,6 +87,22 @@ The ADRs refer to these phases by number.
 | [0002](docs/adr/0002-dual-write-strategy.md) | The jobs table is the outbox; a dispatcher publishes due jobs |
 | [0003](docs/adr/0003-async-io-stack.md) | asyncio throughout: SQLAlchemy asyncio, asyncpg, aio-pika |
 | [0004](docs/adr/0004-dispatch-and-consumption.md) | One quorum queue; the worker acks, nacks or rejects per outcome |
+
+## Reading a job
+
+`GET /jobs/{id}` returns a job's state from PostgreSQL: `status`, `attempts`, `max_attempts`, the
+timestamps, and two fields that depend on the status. It never returns the payload.
+
+| `status` | `result` | `failure` |
+|----------|----------|-----------|
+| `queued`, `running` | `null` | `null` |
+| `succeeded` | what the handler returned, e.g. `{"provider": "fake"}` | `null` |
+| `failed` | `null` | `{"code": "handler_timeout", "message": "the job's handler did not finish in time"}` |
+
+`failure.code` is one of a fixed set of categories and `failure.message` a fixed sentence per code,
+never exception text, which can quote the payload. The key is `failure`, not `error`, so a failed
+job's `200` body cannot be mistaken for the API's error envelope. A handler's result is shown to
+clients, so a handler must never copy its payload into it.
 
 ## Health and readiness probes
 
@@ -144,6 +159,12 @@ The ADRs refer to these phases by number.
   table every dispatcher poll fails and is logged; with an older schema the dispatcher publishes
   as usual and the worker's claim fails, so the worker backs off and requeues each message until
   the schema is there. Nothing is lost. A check at start comes with phase 8.
+- No constraint ties `result` and `error_code` to the status: `GET /jobs/{id}` derives both fields
+  from the status alone, and only the worker's own updates keep the columns consistent. A
+  `failed` row without an error code shows `failure: null`, and a code this version does not know
+  (e.g. one written by a newer worker) is shown with the message "the job failed". A `succeeded`
+  row whose result is missing or not a JSON object shows `result: null`. Each case is logged as a
+  warning, by job ID only.
 - `fake_notifications.job_id` has no index, so looking up a job's notifications (only tests do)
   scans the table. That is fine for the fake provider; a real provider's records would need one.
 - A worker whose lease expired may still finish its handler. Its result is rejected, but its side
