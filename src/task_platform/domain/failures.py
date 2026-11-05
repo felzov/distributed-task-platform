@@ -35,3 +35,19 @@ FAILURE_MESSAGES: Final[Mapping[FailureCode, str]] = MappingProxyType(
 
 # For a stored code this code does not know, e.g. one written by a newer worker.
 UNKNOWN_FAILURE_MESSAGE: Final = "the job failed"
+
+# Whether a failed attempt is worth another one (ADR 0005 decision 1). Every code is listed, so a
+# new one cannot become retryable or permanent by omission (a unit test checks it).
+RETRYABLE: Final[Mapping[FailureCode, bool]] = MappingProxyType(
+    {
+        # The stored payload fails validation the same way on every attempt. A missing handler
+        # (unknown_job_type) is a deployment error, but it is not retried either.
+        FailureCode.UNKNOWN_JOB_TYPE: False,
+        FailureCode.UNSUPPORTED_PAYLOAD_VERSION: False,
+        FailureCode.PAYLOAD_TOO_LARGE: False,
+        FailureCode.INVALID_PAYLOAD: False,
+        # The handler's own error or timeout may not happen on the next attempt.
+        FailureCode.HANDLER_ERROR: True,
+        FailureCode.HANDLER_TIMEOUT: True,
+    }
+)
