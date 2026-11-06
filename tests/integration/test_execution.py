@@ -101,6 +101,10 @@ async def test_a_due_job_is_claimed_run_and_succeeds(
     assert row["lease_expires_at"] is None
     assert row["error_code"] is None
     assert await notifications(engine, job_id) == [1]
+    [attempt] = await attempts(engine, job_id)
+    assert (attempt["outcome"], attempt["error_code"]) == ("succeeded", None)
+    # Closed in the transaction of the job's final update.
+    assert attempt["finished_at"] == row["updated_at"]
     assert_no_sentinel(caplog)
 
 
@@ -241,6 +245,8 @@ async def test_a_stored_payload_that_fails_validation_fails_the_job(
     assert (row["status"], row["attempts"], row["error_code"]) == ("failed", 1, code)
     assert row["lease_expires_at"] is None
     assert await notifications(engine, job_id) == []
+    [attempt] = await attempts(engine, job_id)
+    assert (attempt["outcome"], attempt["error_code"]) == ("failed", code)
 
 
 async def test_a_stored_payload_over_the_current_limit_fails_the_job(
@@ -303,9 +309,12 @@ async def test_a_handler_error_fails_the_job_without_its_text(
     row = await job_row(engine, job_id)
     assert (row["status"], row["error_code"], row["result"]) == ("failed", "handler_error", None)
     assert f"job {job_id} attempt 1 failed: handler_error (builtins." in caplog.text
-    # Neither the database row (besides its payload) nor the log holds the exception's text.
+    [attempt] = await attempts(engine, job_id)
+    assert (attempt["outcome"], attempt["error_code"]) == ("failed", "handler_error")
+    assert attempt["finished_at"] == row["updated_at"]
+    # Neither the database rows (besides the job's payload) nor the log hold the exception's text.
     del row["payload"]
-    assert SENTINEL not in json.dumps(row, default=str)
+    assert SENTINEL not in json.dumps([row, attempt], default=str)
     assert_no_sentinel(caplog)
 
 
@@ -402,12 +411,89 @@ async def test_a_stale_attempt_keeps_its_side_effect_but_not_its_outcome(
     # Fencing rejects writes, not side effects (ADR 0001).
     assert await notifications(engine, job_id) == [1]
     assert f"job {job_id} attempt 1 is no longer current" in caplog.text
+    # Nor its history: the stale attempt's row stays open, for recovery to close (phase 8).
+    [attempt] = await attempts(engine, job_id)
+    assert (attempt["attempt"], attempt["finished_at"], attempt["outcome"]) == (1, None, None)
 
 
-async def test_a_final_update_the_database_cannot_take_leaves_the_job_running(
-    engine: AsyncEngine, test_database_url: str, caplog: pytest.LogCaptureFixture
+async def test_an_attempt_without_a_row_still_finishes_the_job(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    settings: BrokerSettings,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # Another transaction holds the job's row lock past the worker's statement timeout.
+    # A row lost after the claim (a bug or a manual change): nothing to close. The job's outcome
+    # matters more than its history, so the finish goes ahead and reports the gap as an error.
+    job_id = await insert_due_job(engine)
+
+    async def loses_its_row(
+        session_factory: async_sessionmaker[AsyncSession], job: ClaimedJob, payload: PayloadModel
+    ) -> dict[str, Any]:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("DELETE FROM job_attempts WHERE job_id = :id"), {"id": job.id}
+            )
+        return {"done": True}
+
+    outcome = await execute_job(sessions, job_id, {NOTIFICATION_SEND: loses_its_row}, settings)
+
+    assert outcome == Outcome.SUCCEEDED
+    row = await job_row(engine, job_id)
+    assert (row["status"], row["result"]) == ("succeeded", {"done": True})
+    assert await attempts(engine, job_id) == []
+    [record] = [r for r in caplog.records if "had no open attempt row" in r.getMessage()]
+    assert record.levelno == logging.ERROR
+    assert record.getMessage() == (
+        f"job {job_id} attempt 1 had no open attempt row to close;"
+        " its outcome succeeded is on the job only"
+    )
+
+
+async def test_a_later_attempt_closes_its_own_row(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    settings: BrokerSettings,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Two failed attempts before this one: the finish closes attempt 3 and leaves their outcomes.
+    job_id = await insert_due_job(engine, attempts=2)
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO job_attempts (job_id, attempt, finished_at, outcome, error_code)"
+                " VALUES (:id, 1, now(), 'failed', 'handler_error'),"
+                " (:id, 2, now(), 'failed', 'handler_timeout')"
+            ),
+            {"id": job_id},
+        )
+    earlier = await attempts(engine, job_id)
+
+    assert await execute_job(sessions, job_id, HANDLERS, settings) == Outcome.SUCCEEDED
+
+    row = await job_row(engine, job_id)
+    *unchanged, last = await attempts(engine, job_id)
+    assert unchanged == earlier
+    assert (last["attempt"], last["outcome"], last["error_code"]) == (3, "succeeded", None)
+    assert last["finished_at"] == row["updated_at"]
+    assert "had no open attempt row" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "lock",
+    [
+        # The job's update waits past the timeout, before the attempt row is touched.
+        pytest.param("SELECT 1 FROM jobs WHERE id = :id FOR UPDATE", id="job row locked"),
+        # The job's update goes through, then closing the attempt waits past the timeout: the
+        # error rolls both back, so the job is not finished while its attempt stays open.
+        pytest.param(
+            "SELECT 1 FROM job_attempts WHERE job_id = :id FOR UPDATE", id="attempt row locked"
+        ),
+    ],
+)
+async def test_a_final_update_the_database_cannot_take_leaves_the_job_running(
+    engine: AsyncEngine, test_database_url: str, caplog: pytest.LogCaptureFixture, lock: str
+) -> None:
+    # Another transaction holds a row lock past the worker's statement timeout.
     settings = make_test_broker_settings(
         test_database_url,
         UNREACHABLE_BROKER_URL,
@@ -422,8 +508,8 @@ async def test_a_final_update_the_database_cannot_take_leaves_the_job_running(
         session_factory: async_sessionmaker[AsyncSession], job: ClaimedJob, payload: PayloadModel
     ) -> dict[str, Any]:
         await holder.begin()
-        await holder.execute(text("SELECT 1 FROM jobs WHERE id = :id FOR UPDATE"), {"id": job.id})
-        return {}
+        await holder.execute(text(lock), {"id": job.id})
+        return {"done": True}
 
     try:
         outcome = await execute_job(
@@ -435,7 +521,9 @@ async def test_a_final_update_the_database_cannot_take_leaves_the_job_running(
 
     assert outcome == Outcome.FINISH_UNAVAILABLE
     row = await job_row(engine, job_id)
-    assert (row["status"], row["attempts"]) == ("running", 1)
+    assert (row["status"], row["attempts"], row["result"]) == ("running", 1, None)
+    [attempt] = await attempts(engine, job_id)
+    assert (attempt["finished_at"], attempt["outcome"]) == (None, None)
     # 57014: query_canceled by the statement timeout.
     assert f"final update failed: job {job_id} attempt 1," in caplog.text
     assert "(sqlstate 57014)" in caplog.text

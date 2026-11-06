@@ -25,9 +25,11 @@ async def close_attempt(
 ) -> bool:
     """Record how an open attempt ended: succeeded if `failure` is None, else failed with it.
 
-    Returns False if that attempt has no open row: it was already closed, or it started before
-    migration 0003 created the table (ADR 0005 decision 7). The outcome follows from `failure`, so
-    a caller cannot pass a combination that ck_job_attempts_error_code_on_failure would reject.
+    Returns False if that attempt has no open row: it was already closed, it never had one (it
+    started before migration 0003, ADR 0005 decision 7, or its claim skipped `open_attempt`), or
+    the job is unknown. A caller whose claim opened the row never expects False. The outcome
+    follows from `failure`, so a caller cannot pass a combination that
+    ck_job_attempts_error_code_on_failure would reject.
     """
     outcome = AttemptOutcome.SUCCEEDED if failure is None else AttemptOutcome.FAILED
     statement = (

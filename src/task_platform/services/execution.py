@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from task_platform import safe_logging
 from task_platform.config import BrokerSettings
-from task_platform.data.attempts import open_attempt
+from task_platform.data.attempts import close_attempt, open_attempt
 from task_platform.data.jobs import (
     ClaimedJobRow,
     claim_job,
@@ -195,6 +195,7 @@ async def _finish(
     ensure_transition(
         JobStatus.RUNNING, JobStatus.SUCCEEDED if failure is None else JobStatus.FAILED
     )
+    closed = False
     try:
         async with session_factory.begin() as session:
             if failure is None:
@@ -205,6 +206,11 @@ async def _finish(
                 current = await mark_failed(
                     session, job.id, claimed_attempt=job.attempt, error_code=failure
                 )
+            # Only the attempt that still owns the job records its outcome, in the same
+            # transaction (ADR 0005 decision 5): a stale attempt writes neither table, and a
+            # database error rolls both back.
+            if current:
+                closed = await close_attempt(session, job.id, attempt=job.attempt, failure=failure)
     except (SQLAlchemyError, OSError) as exc:
         logger.warning(
             "final update failed: job %s attempt %d, %s (sqlstate %s)",
@@ -219,4 +225,15 @@ async def _finish(
             "job %s attempt %d is no longer current; its outcome was discarded", job.id, job.attempt
         )
         return Outcome.STALE
+    if not closed:
+        # Should not happen: the claim opened this row in its own transaction, and only the
+        # current attempt closes it. Not even for a job claimed before migration 0003: the old
+        # worker that claimed it also finishes it. The job's outcome is kept all the same: raising
+        # would roll the finish back and leave the job running over a gap in its history.
+        logger.error(
+            "job %s attempt %d had no open attempt row to close; its outcome %s is on the job only",
+            job.id,
+            job.attempt,
+            failure or "succeeded",
+        )
     return Outcome.SUCCEEDED if failure is None else Outcome.FAILED
