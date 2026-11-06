@@ -131,6 +131,9 @@ async def claim_job(
     the second waits for the first's row lock and then finds the job no longer `queued`. A `queued`
     job with no attempts left also returns None instead of breaking the attempts CHECK. So does an
     unknown job: a caller that treats that case differently (ADR 0004) has to look the job up.
+
+    A caller that gets a row opens that attempt's history row (`open_attempt`) in the same
+    transaction, so every committed claim has one (ADR 0005 decision 5).
     """
     statement = (
         update(Job)

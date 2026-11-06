@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from task_platform import safe_logging
 from task_platform.config import BrokerSettings
+from task_platform.data.attempts import open_attempt
 from task_platform.data.jobs import (
     ClaimedJobRow,
     claim_job,
@@ -96,6 +97,12 @@ async def execute_job(
     try:
         async with session_factory.begin() as session:
             row = await claim_job(session, job_id, lease_duration_s=settings.lease_duration_s)
+            if row is not None:
+                # In the claim's transaction, so the attempt has a row exactly when the claim
+                # committed (ADR 0005 decision 5). A row already there for this attempt number is
+                # a bug: its unique violation (23505, class 23) rolls the claim back and the claim
+                # is rejected below; the job stays queued with dispatched_at set (phase 8).
+                await open_attempt(session, job_id, attempt=row.attempts)
             # claim_job cannot tell an unknown job from a lost claim; ADR 0004 answers both with
             # an ack, but an unknown job is worth a warning.
             known = row is not None or await select_job(session, job_id) is not None

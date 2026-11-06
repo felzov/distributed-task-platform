@@ -56,6 +56,14 @@ async def job_row(engine: AsyncEngine, job_id: uuid.UUID) -> dict[str, Any]:
         return dict(result.mappings().one())
 
 
+async def attempts(engine: AsyncEngine, job_id: uuid.UUID) -> list[dict[str, Any]]:
+    async with engine.connect() as connection:
+        result = await connection.execute(
+            text("SELECT * FROM job_attempts WHERE job_id = :id ORDER BY attempt"), {"id": job_id}
+        )
+        return [dict(row) for row in result.mappings()]
+
+
 async def notifications(engine: AsyncEngine, job_id: uuid.UUID) -> list[int]:
     async with engine.connect() as connection:
         rows = await connection.scalars(
@@ -110,6 +118,7 @@ async def test_an_unknown_job_is_reported_and_nothing_is_written(
     assert await execute_job(sessions, job_id, HANDLERS, settings) == Outcome.UNKNOWN_JOB
     assert f"unknown job {job_id}" in caplog.text
     assert await notifications(engine, job_id) == []
+    assert await attempts(engine, job_id) == []
 
 
 @pytest.mark.parametrize(
@@ -136,6 +145,8 @@ async def test_a_job_that_cannot_be_claimed_is_left_as_it_is(
     assert await execute_job(sessions, job_id, HANDLERS, settings) == Outcome.NOT_CLAIMED
     assert await job_row(engine, job_id) == before
     assert await notifications(engine, job_id) == []
+    # A lost claim starts no attempt.
+    assert await attempts(engine, job_id) == []
 
 
 async def test_two_deliveries_of_one_job_run_its_handler_once(
@@ -152,6 +163,56 @@ async def test_two_deliveries_of_one_job_run_its_handler_once(
     assert sorted(outcomes) == sorted([Outcome.SUCCEEDED, Outcome.NOT_CLAIMED])
     assert (await job_row(engine, job_id))["attempts"] == 1
     assert await notifications(engine, job_id) == [1]
+    assert [row["attempt"] for row in await attempts(engine, job_id)] == [1]
+
+
+async def test_the_claim_opens_the_attempts_row_before_the_handler_runs(
+    engine: AsyncEngine, sessions: async_sessionmaker[AsyncSession], settings: BrokerSettings
+) -> None:
+    # ADR 0005 decision 5: the row is committed with the claim, so it is there while the handler
+    # runs, and a worker that crashes now leaves an open attempt behind.
+    job_id = await insert_due_job(engine, attempts=2)
+    seen: list[tuple[list[dict[str, Any]], dict[str, Any]]] = []
+
+    async def looks(
+        session_factory: async_sessionmaker[AsyncSession], job: ClaimedJob, payload: PayloadModel
+    ) -> dict[str, Any]:
+        seen.append((await attempts(engine, job.id), await job_row(engine, job.id)))
+        return {}
+
+    await execute_job(sessions, job_id, {NOTIFICATION_SEND: looks}, settings)
+
+    [(rows, job)] = seen
+    [row] = rows
+    # The claim's own attempt number, and the claim's own now().
+    assert row["attempt"] == 3
+    assert row["started_at"] == job["updated_at"]
+    assert (row["finished_at"], row["outcome"], row["error_code"]) == (None, None, None)
+
+
+async def test_a_second_row_for_the_claimed_attempt_rejects_the_claim(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    settings: BrokerSettings,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A row for attempt 1 although the job was never claimed: a bug the claim must not hide. The
+    # unique violation rolls the whole claim back, and redelivering would hit it again.
+    job_id = await insert_due_job(engine)
+    async with engine.begin() as connection:
+        await connection.execute(
+            text("INSERT INTO job_attempts (job_id, attempt) VALUES (:id, 1)"), {"id": job_id}
+        )
+    before = await job_row(engine, job_id)
+    [existing] = await attempts(engine, job_id)
+
+    assert await execute_job(sessions, job_id, HANDLERS, settings) == Outcome.CLAIM_REJECTED
+    assert await job_row(engine, job_id) == before
+    assert await attempts(engine, job_id) == [existing]
+    assert await notifications(engine, job_id) == []
+    # 23505: unique_violation.
+    assert f"claim rejected by the database: job {job_id}," in caplog.text
+    assert "(sqlstate 23505)" in caplog.text
 
 
 # Stored payload no longer valid
@@ -410,6 +471,7 @@ async def test_a_claim_waiting_past_the_statement_timeout_backs_off(
 
     assert outcome == Outcome.CLAIM_UNAVAILABLE
     assert await job_row(engine, job_id) == before
+    assert await attempts(engine, job_id) == []
     assert f"claim failed, database unavailable: job {job_id}," in caplog.text
     assert "(sqlstate 57014)" in caplog.text
 
@@ -431,6 +493,7 @@ async def test_a_claim_the_database_rejects_for_this_job_is_not_retried(
 
     assert await execute_job(sessions, job_id, HANDLERS, settings) == Outcome.CLAIM_REJECTED
     assert await job_row(engine, job_id) == before
+    assert await attempts(engine, job_id) == []
     # 22008: datetime_field_overflow.
     assert f"claim rejected by the database: job {job_id}," in caplog.text
     assert "(sqlstate 22008)" in caplog.text
