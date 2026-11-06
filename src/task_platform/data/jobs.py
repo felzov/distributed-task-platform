@@ -115,8 +115,10 @@ async def mark_dispatched(session: AsyncSession, job_ids: list[uuid.UUID]) -> li
     return list(await session.scalars(statement))
 
 
-# attempts (the claimed attempt, used to fence later writes), type, payload_version, payload
-ClaimedJobRow = Row[int, str, int, dict[str, Any]]
+# attempts (the claimed attempt, used to fence later writes), max_attempts (the job's own budget,
+# for the retry decision: never the current setting, which may have changed since submission),
+# type, payload_version, payload
+ClaimedJobRow = Row[int, int, str, int, dict[str, Any]]
 
 
 async def claim_job(
@@ -148,7 +150,7 @@ async def claim_job(
             updated_at=func.now(),
         )
         # The handler needs the payload. Result rows are logged at DEBUG (limitation, phase 8).
-        .returning(Job.attempts, Job.type, Job.payload_version, Job.payload)
+        .returning(Job.attempts, Job.max_attempts, Job.type, Job.payload_version, Job.payload)
     )
     return (await session.execute(statement)).one_or_none()
 

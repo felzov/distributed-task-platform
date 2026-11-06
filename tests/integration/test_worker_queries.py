@@ -71,7 +71,7 @@ async def test_claim_starts_an_attempt_with_a_lease(engine: AsyncEngine) -> None
     claimed = await claim(engine, job["id"])
 
     assert claimed is not None
-    assert tuple(claimed) == (1, "notification.send", 1, {"recipient": "max@example.com"})
+    assert tuple(claimed) == (1, 5, "notification.send", 1, {"recipient": "max@example.com"})
     row = await job_row(engine, job["id"])
     assert row["status"] == "running"
     assert row["attempts"] == 1
@@ -90,6 +90,17 @@ async def test_each_claim_counts_one_more_attempt(engine: AsyncEngine) -> None:
     assert claimed is not None
     assert claimed.attempts == 3
     assert (await job_row(engine, job["id"]))["attempts"] == 3
+
+
+async def test_claim_returns_the_jobs_own_attempt_budget(engine: AsyncEngine) -> None:
+    # The budget stored at submission, not the current default_max_attempts (5 in the tests):
+    # the retry decision must use the one the job was given (ADR 0005 decision 2).
+    job = await insert_job(engine, max_attempts=3)
+
+    claimed = await claim(engine, job["id"])
+
+    assert claimed is not None
+    assert (claimed.attempts, claimed.max_attempts) == (1, 3)
 
 
 async def test_a_claimed_job_cannot_be_claimed_again(engine: AsyncEngine) -> None:
