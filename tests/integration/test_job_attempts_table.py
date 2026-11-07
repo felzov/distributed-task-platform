@@ -5,30 +5,15 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from tests.integration.rows import insert_job
+from tests.integration.rows import insert_attempt
 
 pytestmark = pytest.mark.integration
 
 # Any instant will do: the CHECKs ask only whether finished_at is set.
 FINISHED = datetime(2026, 1, 1, tzinfo=UTC)
-
-
-async def insert_attempt(engine: AsyncEngine, **overrides: Any) -> dict[str, Any]:
-    """Insert one attempt row with raw SQL (no ORM) for a new job, and return it as a dict."""
-    if "job_id" not in overrides:
-        overrides["job_id"] = (await insert_job(engine))["id"]
-    values: dict[str, Any] = {"attempt": 1} | overrides
-    columns = ", ".join(values)
-    params = ", ".join(f":{column}" for column in values)
-    async with engine.begin() as connection:
-        result = await connection.execute(
-            text(f"INSERT INTO job_attempts ({columns}) VALUES ({params}) RETURNING *"), values
-        )
-        return dict(result.mappings().one())
 
 
 # Normal path

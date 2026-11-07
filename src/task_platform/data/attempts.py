@@ -1,8 +1,9 @@
 """Queries on the job_attempts table (ADR 0005 decision 5). Callers own the transaction."""
 
 import uuid
+from datetime import datetime
 
-from sqlalchemy import func, insert, update
+from sqlalchemy import Row, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from task_platform.data.models import JobAttempt
@@ -44,3 +45,28 @@ async def close_attempt(
         .returning(JobAttempt.attempt)
     )
     return (await session.scalar(statement)) is not None
+
+
+# attempt, started_at, finished_at, outcome, error_code
+AttemptRow = Row[int, datetime, datetime | None, str | None, str | None]
+
+
+async def select_attempts(session: AsyncSession, job_id: uuid.UUID) -> list[AttemptRow]:
+    """Return a job's attempt rows, lowest attempt first; empty if it has none or is unknown.
+
+    The first row need not be attempt 1: attempts that started before migration 0003 have no row
+    (ADR 0005 decision 7). An attempt still running, or whose worker crashed, has no outcome yet.
+    """
+    # The primary key (job_id, attempt) serves both the condition and the order.
+    statement = (
+        select(
+            JobAttempt.attempt,
+            JobAttempt.started_at,
+            JobAttempt.finished_at,
+            JobAttempt.outcome,
+            JobAttempt.error_code,
+        )
+        .where(JobAttempt.job_id == job_id)
+        .order_by(JobAttempt.attempt)
+    )
+    return list((await session.execute(statement)).all())

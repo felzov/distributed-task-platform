@@ -2,7 +2,7 @@
 
 import re
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -10,10 +10,10 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from task_platform.data.attempts import close_attempt, open_attempt
+from task_platform.data.attempts import close_attempt, open_attempt, select_attempts
 from task_platform.domain.attempts import AttemptOutcome
 from task_platform.domain.failures import FailureCode
-from tests.integration.rows import insert_job
+from tests.integration.rows import insert_attempt, insert_job
 
 pytestmark = pytest.mark.integration
 
@@ -190,3 +190,72 @@ async def test_outcome_constraint_lists_exactly_the_domain_outcomes(engine: Asyn
     assert definition is not None
     found = set(re.findall(r"'(\w+)'::text", definition))
     assert found == {outcome.value for outcome in AttemptOutcome}
+
+
+# select_attempts
+
+STARTED = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+async def selected(engine: AsyncEngine, job_id: uuid.UUID) -> list[tuple[Any, ...]]:
+    async with async_sessionmaker(engine)() as session:
+        return [tuple(row) for row in await select_attempts(session, job_id)]
+
+
+async def test_a_jobs_attempts_are_returned_lowest_first_with_every_column(
+    engine: AsyncEngine,
+) -> None:
+    job_id = (await insert_job(engine))["id"]
+    finished = STARTED + timedelta(seconds=1)
+    # Inserted out of order, so only ORDER BY can put them in order.
+    await insert_attempt(engine, job_id=job_id, attempt=3, started_at=STARTED)
+    await insert_attempt(
+        engine,
+        job_id=job_id,
+        attempt=1,
+        started_at=STARTED,
+        finished_at=finished,
+        outcome="failed",
+        error_code=FailureCode.HANDLER_TIMEOUT,
+    )
+    await insert_attempt(
+        engine,
+        job_id=job_id,
+        attempt=2,
+        started_at=STARTED,
+        finished_at=finished,
+        outcome="succeeded",
+    )
+
+    assert await selected(engine, job_id) == [
+        (1, STARTED, finished, "failed", "handler_timeout"),
+        (2, STARTED, finished, "succeeded", None),
+        # Still open: no finish, no outcome.
+        (3, STARTED, None, None, None),
+    ]
+
+
+async def test_only_the_named_jobs_attempts_are_returned(engine: AsyncEngine) -> None:
+    job_id = (await insert_job(engine))["id"]
+    other_job = (await insert_job(engine))["id"]
+    for attempt in (1, 2):
+        await insert_attempt(engine, job_id=other_job, attempt=attempt)
+    await insert_attempt(engine, job_id=job_id, attempt=1)
+
+    assert [row[0] for row in await selected(engine, job_id)] == [1]
+
+
+async def test_a_history_may_start_after_attempt_1(engine: AsyncEngine) -> None:
+    # A job that was running when migration 0003 ran: its earlier attempts have no rows.
+    job_id = (await insert_job(engine))["id"]
+    for attempt in (4, 3):
+        await insert_attempt(engine, job_id=job_id, attempt=attempt)
+
+    assert [row[0] for row in await selected(engine, job_id)] == [3, 4]
+
+
+@pytest.mark.parametrize("known", [True, False], ids=["job without attempts", "unknown job"])
+async def test_no_attempts_is_an_empty_list(engine: AsyncEngine, known: bool) -> None:
+    job_id = (await insert_job(engine))["id"] if known else uuid.uuid4()
+
+    assert await selected(engine, job_id) == []
