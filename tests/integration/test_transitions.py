@@ -19,7 +19,13 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from task_platform.data.jobs import claim_job, mark_dispatched, mark_failed, mark_succeeded
+from task_platform.data.jobs import (
+    claim_job,
+    mark_dispatched,
+    mark_failed,
+    mark_retry,
+    mark_succeeded,
+)
 from task_platform.domain.failures import FailureCode
 from task_platform.domain.job_status import ALLOWED_TRANSITIONS, JobStatus
 from tests.integration.rows import insert_job
@@ -52,11 +58,22 @@ async def fail(session: AsyncSession, job_id: uuid.UUID) -> object:
     )
 
 
+async def retry(session: AsyncSession, job_id: uuid.UUID) -> object:
+    return await mark_retry(
+        session,
+        job_id,
+        claimed_attempt=ATTEMPT,
+        error_code=FailureCode.HANDLER_ERROR,
+        delay_s=60,
+    )
+
+
 WRITES: dict[str, Write] = {
     "claim_job": claim,
     "mark_dispatched": dispatch,
     "mark_succeeded": succeed,
     "mark_failed": fail,
+    "mark_retry": retry,
 }
 
 # Where each write applies, and the status it leaves. Every other pair must not touch the row. Kept
@@ -67,6 +84,7 @@ APPLIES: dict[tuple[str, JobStatus], JobStatus] = {
     ("mark_dispatched", JobStatus.QUEUED): JobStatus.QUEUED,
     ("mark_succeeded", JobStatus.RUNNING): JobStatus.SUCCEEDED,
     ("mark_failed", JobStatus.RUNNING): JobStatus.FAILED,
+    ("mark_retry", JobStatus.RUNNING): JobStatus.QUEUED,
 }
 # The only writes allowed to apply without a transition. Any other write that keeps the status
 # while changing the row is a re-claim or a rewrite, even if APPLIES were edited to allow it.
