@@ -27,3 +27,17 @@ async def insert_job(engine: AsyncEngine, **overrides: Any) -> dict[str, Any]:
             text(f"INSERT INTO jobs ({columns}) VALUES ({params}) RETURNING *"), values
         )
         return dict(result.mappings().one())
+
+
+async def insert_attempt(engine: AsyncEngine, **overrides: Any) -> dict[str, Any]:
+    """Insert one attempt row with raw SQL (no ORM) for a new job, and return it as a dict."""
+    if "job_id" not in overrides:
+        overrides["job_id"] = (await insert_job(engine))["id"]
+    values: dict[str, Any] = {"attempt": 1} | overrides
+    columns = ", ".join(values)
+    params = ", ".join(f":{column}" for column in values)
+    async with engine.begin() as connection:
+        result = await connection.execute(
+            text(f"INSERT INTO job_attempts ({columns}) VALUES ({params}) RETURNING *"), values
+        )
+        return dict(result.mappings().one())

@@ -1,4 +1,4 @@
-"""`GET /jobs/{id}` rejects an invalid id before touching the database.
+"""`GET /jobs/{id}` and `GET /jobs/{id}/attempts` reject an invalid id before touching the database.
 
 The app points at a closed port, so the expected 422s also show that no query ran.
 """
@@ -14,12 +14,16 @@ from tests.settings import UNREACHABLE_DATABASE_URL, make_test_settings
 
 SENTINEL = "s3cr3t-sentinel-7731"
 
+# Both routes that read a job by id: its state and its attempts.
+ROUTES = pytest.mark.parametrize("suffix", ["", "/attempts"], ids=["job", "attempts"])
+
 
 async def get(path: str) -> httpx.Response:
     async with app_client(create_app(make_test_settings(UNREACHABLE_DATABASE_URL))) as client:
         return await client.get(path)
 
 
+@ROUTES
 @pytest.mark.parametrize(
     "job_id",
     [
@@ -29,8 +33,8 @@ async def get(path: str) -> httpx.Response:
         pytest.param(str(uuid.uuid4())[:-1], id="one character short"),
     ],
 )
-async def test_invalid_id_is_rejected_without_echoing_it(job_id: str) -> None:
-    response = await get(f"/jobs/{job_id}")
+async def test_invalid_id_is_rejected_without_echoing_it(job_id: str, suffix: str) -> None:
+    response = await get(f"/jobs/{job_id}{suffix}")
 
     assert response.status_code == 422
     assert response.json() == {
@@ -43,8 +47,9 @@ async def test_invalid_id_is_rejected_without_echoing_it(job_id: str) -> None:
     assert job_id not in response.text
 
 
-async def test_unreachable_database_returns_503() -> None:
-    response = await get(f"/jobs/{uuid.uuid4()}")
+@ROUTES
+async def test_unreachable_database_returns_503(suffix: str) -> None:
+    response = await get(f"/jobs/{uuid.uuid4()}{suffix}")
 
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "service_unavailable"

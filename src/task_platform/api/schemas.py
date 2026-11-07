@@ -6,6 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from task_platform.domain.attempts import AttemptOutcome
 from task_platform.domain.job_status import JobStatus
 
 
@@ -54,6 +55,25 @@ class JobResponse(BaseModel):
     result: dict[str, Any] | None
     # Set only for a failed job.
     failure: FailureBody | None
+
+
+class AttemptBody(BaseModel):
+    """One attempt of a job. `outcome` is null while it runs, and after its worker crashed."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    attempt: int
+    started_at: datetime
+    finished_at: datetime | None
+    outcome: AttemptOutcome | None
+    # Set only for a failed attempt.
+    failure: FailureBody | None
+
+
+class AttemptsResponse(BaseModel):
+    """Body of `GET /jobs/{id}/attempts`: lowest attempt first; it need not start at 1."""
+
+    attempts: list[AttemptBody]
 
 
 class ErrorBody(BaseModel):

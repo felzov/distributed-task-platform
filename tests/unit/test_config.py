@@ -295,3 +295,51 @@ def test_db_error_backoff_bounds(backoff_s: float, accepted: bool) -> None:
     else:
         with pytest.raises(ValidationError, match="worker_db_error_backoff_s"):
             broker_settings(**values)
+
+
+def test_retry_delays_are_read_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RETRY_BASE_DELAY_S", "0.5")
+    monkeypatch.setenv("RETRY_MAX_DELAY_S", "60")
+    result = broker_settings(database_url=URL, broker_url=BROKER_URL)
+    assert (result.retry_base_delay_s, result.retry_max_delay_s) == (0.5, 60.0)
+
+
+@pytest.mark.parametrize("field", ["retry_base_delay_s", "retry_max_delay_s"])
+@pytest.mark.parametrize("value", [0, -1, float("nan")])
+def test_non_positive_or_nan_retry_delays_are_rejected(field: str, value: float) -> None:
+    # NaN would pass the base <= cap check (every comparison with NaN is False) and then make every
+    # retry raise in the worker; today pydantic's gt/le reject it, and this test keeps it that way.
+    with pytest.raises(ValidationError, match=field):
+        broker_settings(database_url=URL, broker_url=BROKER_URL, **{field: value})
+
+
+@pytest.mark.parametrize(
+    ("cap_s", "accepted"),
+    [(86400.0, True), (86400.001, False), (float("inf"), False), (float("nan"), False)],
+)
+def test_retry_cap_is_at_most_one_day(cap_s: float, accepted: bool) -> None:
+    # ADR 0005 decision 3; also keeps now() + delay inside PostgreSQL's timestamp range.
+    values = {"database_url": URL, "broker_url": BROKER_URL, "retry_max_delay_s": cap_s}
+    if accepted:
+        assert broker_settings(**values).retry_max_delay_s == cap_s
+    else:
+        with pytest.raises(ValidationError, match="retry_max_delay_s"):
+            broker_settings(**values)
+
+
+@pytest.mark.parametrize(
+    ("base_s", "accepted"),
+    [(300.0, True), (0.001, True), (300.001, False), (float("inf"), False)],
+)
+def test_retry_base_must_not_exceed_the_cap(base_s: float, accepted: bool) -> None:
+    values = {
+        "database_url": URL,
+        "broker_url": BROKER_URL,
+        "retry_base_delay_s": base_s,
+        "retry_max_delay_s": 300.0,
+    }
+    if accepted:
+        assert broker_settings(**values).retry_base_delay_s == base_s
+    else:
+        with pytest.raises(ValidationError, match="retry_base_delay_s must not exceed"):
+            broker_settings(**values)

@@ -9,7 +9,9 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from task_platform.config import Settings
+from task_platform.data.attempts import AttemptRow, select_attempts
 from task_platform.data.jobs import insert_job, select_job
+from task_platform.domain.attempts import AttemptOutcome
 from task_platform.domain.errors import JobNotFoundError
 from task_platform.domain.failures import FAILURE_MESSAGES, UNKNOWN_FAILURE_MESSAGE, FailureCode
 from task_platform.domain.job_status import JobStatus
@@ -50,6 +52,18 @@ class JobState:
     created_at: datetime
     updated_at: datetime
     result: dict[str, Any] | None
+    failure: Failure | None
+
+
+@dataclass(frozen=True)
+class AttemptState:
+    """One recorded attempt of a job. No outcome yet: still running, or its worker crashed."""
+
+    attempt: int
+    started_at: datetime
+    finished_at: datetime | None
+    outcome: AttemptOutcome | None
+    # Set only for a failed attempt.
     failure: Failure | None
 
 
@@ -119,11 +133,56 @@ def _failure(job_id: uuid.UUID, error_code: str | None) -> Failure | None:
         # Not written by this code: mark_failed always sets a code (no CHECK enforces it, D4).
         logger.warning("failed job %s has no error code", job_id)
         return None
-    try:
-        message = FAILURE_MESSAGES[FailureCode(error_code)]
-    except ValueError:
-        # Not one of ours, e.g. written by a newer worker. Still a category, never input, so it is
-        # safe to return; one bad row must not make the job unreadable.
+    message = _known_message(error_code)
+    if message is None:
         logger.warning("failed job %s has an unknown error code", job_id)
-        message = UNKNOWN_FAILURE_MESSAGE
-    return Failure(code=error_code, message=message)
+    return Failure(code=error_code, message=message or UNKNOWN_FAILURE_MESSAGE)
+
+
+def _known_message(error_code: str) -> str | None:
+    """The fixed message of a code this code knows, else None.
+
+    An unknown code, e.g. one written by a newer worker, is still a category, never input, so it is
+    safe to return with a generic message: one bad row must not make a job unreadable.
+    """
+    try:
+        return FAILURE_MESSAGES[FailureCode(error_code)]
+    except ValueError:
+        return None
+
+
+async def get_attempts(
+    session_factory: async_sessionmaker[AsyncSession], job_id: uuid.UUID
+) -> list[AttemptState]:
+    """A job's recorded attempts, lowest first. Raises JobNotFoundError.
+
+    Empty for a job not claimed yet, and for one that ran before migration 0003. The first need
+    not be attempt 1: attempts that started before migration 0003 have no row (ADR 0005
+    decision 7).
+    """
+    async with session_factory() as session:
+        rows = await select_attempts(session, job_id)
+        # Only an empty history needs the job itself: a row's foreign key proves the job exists.
+        # Jobs are never deleted, so asking after the attempts cannot give a wrong 404.
+        known = bool(rows) or await select_job(session, job_id) is not None
+    if not known:
+        raise JobNotFoundError()
+    return [_attempt(job_id, row) for row in rows]
+
+
+def _attempt(job_id: uuid.UUID, row: AttemptRow) -> AttemptState:
+    # ck_job_attempts_error_code_on_failure ties the code to a failed outcome, so unlike
+    # jobs.error_code (see JobState) the column alone says whether the attempt failed.
+    failure = None
+    if row.error_code is not None:
+        message = _known_message(row.error_code)
+        if message is None:
+            logger.warning("job %s attempt %d has an unknown error code", job_id, row.attempt)
+        failure = Failure(code=row.error_code, message=message or UNKNOWN_FAILURE_MESSAGE)
+    return AttemptState(
+        attempt=row.attempt,
+        started_at=row.started_at,
+        finished_at=row.finished_at,
+        outcome=None if row.outcome is None else AttemptOutcome(row.outcome),
+        failure=failure,
+    )

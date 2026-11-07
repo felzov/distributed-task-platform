@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 PREFETCH_COUNT: Final = 1
 
 # Not processed: the database could not take the claim or the final update. nack does not count
-# towards the delivery limit (ADR 0004 decision 7). Every other outcome is final and acked.
+# towards the delivery limit (ADR 0004 decision 7). Every other outcome is final for its message
+# and acked, RETRY_SCHEDULED included: the retry comes back as a new message (ADR 0005).
 _NACKED: Final = frozenset({Outcome.CLAIM_UNAVAILABLE, Outcome.FINISH_UNAVAILABLE})
 
 
