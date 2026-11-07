@@ -34,6 +34,7 @@ async def test_error_responses_use_the_envelope() -> None:
     expected = {
         ("/jobs", "post"): {"413", "422", "500", "503"},
         ("/jobs/{job_id}", "get"): {"404", "422", "500", "503"},
+        ("/jobs/{job_id}/attempts", "get"): {"404", "422", "500", "503"},
     }
     for (path, method), codes in expected.items():
         responses = spec["paths"][path][method]["responses"]
@@ -90,3 +91,37 @@ async def test_job_response_documents_result_and_failure() -> None:
         {"type": "null"},
     ]
     assert set(schemas["FailureBody"]["required"]) == {"code", "message"}
+
+
+async def test_attempts_response_documents_each_attempt() -> None:
+    app = create_app(make_test_settings(UNREACHABLE_DATABASE_URL))
+    try:
+        spec = app.openapi()
+    finally:
+        await app.state.engine.dispose()
+
+    schemas = spec["components"]["schemas"]
+    path = "/jobs/{job_id}/attempts"
+    ok = spec["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
+    assert ok["schema"] == {"$ref": "#/components/schemas/AttemptsResponse"}
+    assert schemas["AttemptsResponse"]["properties"]["attempts"]["items"] == {
+        "$ref": "#/components/schemas/AttemptBody"
+    }
+    attempt = schemas["AttemptBody"]
+    assert set(attempt["required"]) == {
+        "attempt",
+        "started_at",
+        "finished_at",
+        "outcome",
+        "failure",
+    }
+    # Null while the attempt runs; otherwise one of the stored outcomes.
+    assert attempt["properties"]["outcome"]["anyOf"] == [
+        {"$ref": "#/components/schemas/AttemptOutcome"},
+        {"type": "null"},
+    ]
+    assert set(schemas["AttemptOutcome"]["enum"]) == {"succeeded", "failed"}
+    assert attempt["properties"]["failure"]["anyOf"] == [
+        {"$ref": "#/components/schemas/FailureBody"},
+        {"type": "null"},
+    ]
