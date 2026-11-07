@@ -1,6 +1,6 @@
 # ADR 0004 — Dispatch and consumption over RabbitMQ
 
-- **Status:** Accepted (updated 2026-11-02)
+- **Status:** Accepted (updated 2026-11-07)
 - **Date:** 2026-10-29
 
 ## Context
@@ -115,6 +115,35 @@ observed in its integration tests:
   aio-pika ends the consumer anyway, the worker process exits instead of idling.
 - A message whose worker stopped while holding it comes back with `x-delivery-count` 1 (tested
   with a consumer), as decision 7 says; a redelivery after `nack` carries none.
+
+**Update 2026-11-07 (phase 5, retries):** ADR 0005 replaces the first sentence of the paragraph
+under decision 6's table ("until phase 5 adds retries"); the rest of that paragraph still holds.
+The rows of the table change as follows; every other row stays as it is:
+
+| Outcome | Broker action | Job |
+|---------|---------------|-----|
+| Stored payload fails validation | `ack` after the fenced update | `running → failed` at once, with the matching code: never retried |
+| Handler raises or exceeds `handler_timeout_s`, attempts left | `ack` after the fenced retry update | `running → queued`, `available_at` = `now()` + backoff, `dispatched_at` and lease cleared, `error_code` = this attempt's code |
+| Handler raises or exceeds `handler_timeout_s`, last attempt | `ack` after the fenced update | `running → failed`, the last attempt's code |
+| Handler succeeds | `ack` after the fenced update | `running → succeeded`, `error_code` cleared |
+
+- A retry is acknowledged like every other final outcome. The next attempt arrives as a new
+  message, published by the dispatcher once the job is due (ADR 0005 decision 4), so a retry never
+  counts towards the delivery limit in decision 7.
+- The retry update is one of the final fenced updates: a database error during it takes the
+  "final fenced update fails" row (`nack`, the job stays `running`), and a stale attempt matches 0
+  rows and is acked.
+- The retry update also matches 0 rows when the job's `max_attempts` was lowered after the claim,
+  which only a manual change to the row can do. The same transaction then tries the fenced update
+  to `failed`: it applies, so the job fails with the attempt's code instead of staying `running`,
+  and the worker logs it at ERROR. A stale attempt is refused by both updates.
+- Each attempt has a row in `job_attempts` (ADR 0005 decision 5). The claim inserts it; a row that
+  already exists for that attempt number is a bug, and its unique violation (SQLSTATE 23505, class
+  23) fails the claim on purpose: the claim rolls back, the worker logs it at ERROR and acks, and
+  the job stays `queued` with `dispatched_at` set until phase 8, as for any class 23 claim error
+  above. The finish closes the row in its own transaction. If the job update applied but there was
+  no open row to close, the worker logs it at ERROR and keeps the job's outcome: raising would roll
+  the finish back and leave the job `running`.
 
 ## Consequences
 
