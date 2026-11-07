@@ -219,6 +219,17 @@ async def test_mark_succeeded_finishes_the_attempt(engine: AsyncEngine) -> None:
     assert row["updated_at"] > claimed_at
 
 
+async def test_success_after_a_failed_attempt_clears_its_code(engine: AsyncEngine) -> None:
+    # What a retry leaves: queued again, attempt 1 counted, its failure's code still on the job.
+    job = await insert_job(engine, attempts=1, error_code="handler_error")
+    await claim(engine, job["id"])
+
+    assert await succeed(engine, job["id"], attempt=2)
+
+    row = await job_row(engine, job["id"])
+    assert (row["status"], row["error_code"], row["result"]) == ("succeeded", None, RESULT)
+
+
 async def test_mark_failed_finishes_the_attempt(engine: AsyncEngine) -> None:
     job = await insert_job(engine)
     await claim(engine, job["id"])

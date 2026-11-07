@@ -161,9 +161,13 @@ async def claim_job(
 async def mark_succeeded(
     session: AsyncSession, job_id: uuid.UUID, *, claimed_attempt: int, result: dict[str, Any]
 ) -> bool:
-    """Finish a claimed attempt as `succeeded`; False if that attempt is no longer current."""
+    """Finish a claimed attempt as `succeeded`; False if that attempt is no longer current.
+
+    Clears the code an earlier attempt's failure left on the job: the job did not fail, and the
+    failed attempts keep their codes in `job_attempts` (ADR 0005 decision 6).
+    """
     statement = _fenced_finish(job_id, claimed_attempt).values(
-        status=JobStatus.SUCCEEDED, result=result
+        status=JobStatus.SUCCEEDED, result=result, error_code=None
     )
     return (await session.scalar(statement)) is not None
 
