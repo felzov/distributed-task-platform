@@ -1,4 +1,5 @@
-"""`POST /jobs` (size-capped body, envelope check, then the service) and `GET /jobs/{id}`."""
+"""`POST /jobs` (size-capped body, envelope check, then the service), `GET /jobs/{id}` and
+`GET /jobs/{id}/attempts`."""
 
 import uuid
 from typing import Any, Final
@@ -9,13 +10,15 @@ from pydantic import ValidationError
 from task_platform.api.dependencies import AppSettings, SessionFactory
 from task_platform.api.errors import DATABASE_ERROR_RESPONSES, ApiError, ApiErrorCode
 from task_platform.api.schemas import (
+    AttemptBody,
+    AttemptsResponse,
     ErrorResponse,
     JobResponse,
     SubmitJobRequest,
     SubmitJobResponse,
 )
 from task_platform.domain.payloads import safe_error_details
-from task_platform.services.jobs import get_job, submit_job
+from task_platform.services.jobs import get_attempts, get_job, submit_job
 
 router = APIRouter()
 
@@ -113,3 +116,20 @@ async def post_job(
 async def read_job(job_id: uuid.UUID, session_factory: SessionFactory) -> JobResponse:
     """A job's current state, without its payload. An invalid UUID never reaches the database."""
     return JobResponse.model_validate(await get_job(session_factory, job_id))
+
+
+@router.get(
+    "/jobs/{job_id}/attempts",
+    responses={
+        status.HTTP_404_NOT_FOUND: {"model": ErrorResponse},
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": ErrorResponse},
+        **DATABASE_ERROR_RESPONSES,
+    },
+)
+async def read_attempts(job_id: uuid.UUID, session_factory: SessionFactory) -> AttemptsResponse:
+    """A job's recorded attempts, lowest first.
+
+    Empty until the job is first claimed, and for a job that ran before migration 0003.
+    """
+    attempts = await get_attempts(session_factory, job_id)
+    return AttemptsResponse(attempts=[AttemptBody.model_validate(a) for a in attempts])

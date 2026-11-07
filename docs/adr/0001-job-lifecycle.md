@@ -1,6 +1,6 @@
 # ADR 0001 — Job lifecycle and state transitions
 
-- **Status:** Accepted (updated 2026-11-03)
+- **Status:** Accepted (updated 2026-11-07)
 - **Date:** 2026-10-24
 
 ## Context
@@ -84,6 +84,15 @@ other write that does, such as re-claiming a `running` job, counts as a violatio
 write's status condition, or making it write the wrong target status, made the test fail (checked
 once by editing the code). The conditions use the domain's `JobStatus` values instead of string
 literals.
+
+**Update 2026-11-07 (phase 5):** the open point in decision 5 is closed by ADR 0005: exponential
+backoff with full jitter, and only the handler's own failures are retried. The retry is the first
+write that uses `running → queued`. It is fenced like the finishes in decision 7 (status `running`
+and the claimed attempt), and it also requires `attempts < max_attempts`, so a requeued job always
+has an attempt left for its next claim. As decision 5 requires, the same update sets
+`available_at`, clears `dispatched_at`, and also clears the lease. The test from the phase 4 update
+now covers five writes, the retry included; removing its status condition, its attempt fence or
+its budget condition made a test fail (checked once by editing the code).
 
 ## Consequences
 

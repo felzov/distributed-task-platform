@@ -40,6 +40,20 @@ class Job(Base):
     result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
 
+class JobAttempt(Base):
+    """One attempt of a job, opened by its claim and closed by its finish (ADR 0005 decision 5)."""
+
+    __tablename__ = "job_attempts"
+
+    # The foreign key to jobs and the CHECKs live in migration 0003, like every other constraint.
+    job_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    attempt: Mapped[int] = mapped_column(primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    outcome: Mapped[str | None] = mapped_column(Text)
+    error_code: Mapped[str | None] = mapped_column(Text)
+
+
 class FakeNotification(Base):
     """One call to the fake notification provider (ADR 0004); duplicates are kept on purpose."""
 

@@ -4,14 +4,15 @@ A background-job system built to make failure behaviour explicit: an HTTP API sa
 PostgreSQL, a dispatcher publishes them to RabbitMQ, and separate workers run them with bounded
 retries, so slow work stays out of the request path and every failure is recorded.
 
-> **Status: early development (phase 4 of 10).** So far there are the domain rules, a local
+> **Status: early development (phase 5 of 10).** So far there are the domain rules, a local
 > PostgreSQL with migrations for the `jobs` table (including the lease, error and result columns
-> the worker writes) and the fake provider's `fake_notifications` table, `POST /jobs` (validates
-> and saves a job; 503 when the database is unavailable), `GET /jobs/{id}` (a job's state, result
-> or failure, never its payload), the `/health` and `/ready` probes, a local RabbitMQ with the
+> the worker writes), the `job_attempts` table and the fake provider's `fake_notifications` table,
+> `POST /jobs` (validates and saves a job; 503 when the database is unavailable), `GET /jobs/{id}`
+> (a job's state, result or failure, never its payload), `GET /jobs/{id}/attempts` (each recorded
+> attempt and how it ended), the `/health` and `/ready` probes, a local RabbitMQ with the
 > connection, queue and confirmed-publish code, the dispatcher process that publishes saved jobs
-> to it, the worker process that claims each job, runs it against a fake notification provider
-> and records the result (no retries yet: a failed job stays `failed`), and the development
+> to it, the worker process that claims each job, runs it against a fake notification provider,
+> records the result and retries the handler's own failures with backoff, and the development
 > checks (see Development setup). Architecture says which parts of the design run today; MVP
 > scope and the roadmap describe the planned design; Known limitations covers both.
 
@@ -36,11 +37,13 @@ The diagram and the bullets describe the design; the last bullet says what runs 
   message cannot claim a job that is already claimed. Each claim holds a lease; jobs of crashed
   workers are recovered when the lease expires, and a stale worker's late result is rejected
   ([ADR 0001](docs/adr/0001-job-lifecycle.md)).
-- **Running today (phase 4):** the API, the dispatcher and the worker run as separate processes
-  (`make run`, `make dispatcher`, `make worker`), with the claim, the lease column and the fenced
-  final update. An integration test takes one job from `POST /jobs` through a dispatcher poll and
-  a worker to `succeeded`. **Not yet:** recovery of expired leases and lost messages (phase 8),
-  retries (phase 5) and dead letters (phase 6).
+- **Running today (phase 5):** the API, the dispatcher and the worker run as separate processes
+  (`make run`, `make dispatcher`, `make worker`), with the claim, the lease column, the fenced
+  final update, retries with exponential backoff and jitter, and a row per attempt. Integration
+  tests take a job from `POST /jobs` through the dispatcher and a worker to `succeeded`, once at
+  the first attempt and once after two failed attempts, and a job that always fails to `failed`
+  after its last attempt. **Not yet:** recovery of expired leases and lost messages (phase 8) and
+  dead letters (phase 6).
 
 ## MVP scope
 
@@ -72,7 +75,7 @@ The ADRs refer to these phases by number.
 2. HTTP API and durable job records *(done)*
 3. Dispatcher, RabbitMQ and the first worker *(done)*
 4. Status and result endpoints *(done)*
-5. Retries with exponential backoff and jitter
+5. Retries with exponential backoff and jitter *(done)*
 6. Dead letters and failure inspection
 7. Idempotency for submission and side effects
 8. Graceful shutdown, stale-job and lost-message recovery, broker outages
@@ -87,6 +90,7 @@ The ADRs refer to these phases by number.
 | [0002](docs/adr/0002-dual-write-strategy.md) | The jobs table is the outbox; a dispatcher publishes due jobs |
 | [0003](docs/adr/0003-async-io-stack.md) | asyncio throughout: SQLAlchemy asyncio, asyncpg, aio-pika |
 | [0004](docs/adr/0004-dispatch-and-consumption.md) | One quorum queue; the worker acks, nacks or rejects per outcome |
+| [0005](docs/adr/0005-retries-and-attempt-records.md) | Only handler failures are retried, with full-jitter backoff; a row per attempt |
 
 ## Reading a job
 
@@ -103,6 +107,33 @@ timestamps, and two fields that depend on the status. It never returns the paylo
 never exception text, which can quote the payload. The key is `failure`, not `error`, so a failed
 job's `200` body cannot be mistaken for the API's error envelope. A handler's result is shown to
 clients, so a handler must never copy its payload into it.
+
+A job that is waiting for a retry is `queued` with `attempts > 0` and shows `failure: null`: its
+earlier failures are in its attempts.
+
+## Retries and attempts
+
+When a handler raises (`handler_error`) or exceeds `HANDLER_TIMEOUT_S` (`handler_timeout`), the
+worker puts the job back to `queued`, due after a backoff, and acks the message; the dispatcher
+publishes it again once it is due. After attempt `n` fails, the backoff is a random share of
+`min(RETRY_MAX_DELAY_S, RETRY_BASE_DELAY_S × 2^(n−1))` (full jitter). The job fails when its last
+attempt (`max_attempts`, set at submission from `DEFAULT_MAX_ATTEMPTS`) fails. A stored payload
+that no longer passes validation fails the job at once: it would fail the same way every time
+([ADR 0005](docs/adr/0005-retries-and-attempt-records.md)).
+
+`GET /jobs/{id}/attempts` lists the job's recorded attempts, lowest first, never its payload:
+
+```json
+{"attempts": [
+  {"attempt": 1, "started_at": "…", "finished_at": "…", "outcome": "failed",
+   "failure": {"code": "handler_error", "message": "the job's handler raised an error"}},
+  {"attempt": 2, "started_at": "…", "finished_at": null, "outcome": null, "failure": null}
+]}
+```
+
+`outcome` is `succeeded`, `failed`, or `null` while the attempt runs. The list is empty until the
+job is first claimed, and for a job that ran before migration 0003; an unknown job gets `404
+job_not_found`. The list need not start at attempt 1: see Known limitations.
 
 ## Health and readiness probes
 
@@ -139,7 +170,15 @@ clients, so a handler must never copy its payload into it.
 - Ctrl-C stops the dispatcher with a traceback, abandoning the poll in progress: its transaction
   rolls back and those jobs are published again later, so publishes the broker had already
   confirmed become duplicates. Graceful shutdown comes in phase 8.
-- Until retries arrive (phase 5), every handler failure fails the job for good.
+- A retry runs the handler again, side effects included: a handler that called the provider and
+  then timed out calls it again. The fake provider records one row per attempt that reached it.
+  Idempotent handlers come with phase 7.
+- Full jitter has no minimum wait, so a retry can be published almost at once. There is no
+  circuit breaker: while a provider is down, every job uses up all its attempts.
+- Attempt history starts with migration 0003. Jobs that ran before it have no attempt rows, and a
+  job that was running during the migration lists its attempts from the next one on.
+- An attempt whose worker crashed stays open (`finished_at` and `outcome` null) until stale-job
+  recovery (phase 8), which must close it in the same transaction as the job's own change.
 - A claim the database rejects because of the job's own data (SQLSTATE class 22 or 23) is logged
   at ERROR and its message acked: the job stays `queued`, already dispatched, until lost-message
   recovery (phase 8). Retrying would fail the same way on every delivery (ADR 0004).
@@ -158,7 +197,9 @@ clients, so a handler must never copy its payload into it.
   Against a database that is unmigrated or behind this code they keep running. Without the `jobs`
   table every dispatcher poll fails and is logged; with an older schema the dispatcher publishes
   as usual and the worker's claim fails, so the worker backs off and requeues each message until
-  the schema is there. Nothing is lost. A check at start comes with phase 8.
+  the schema is there. Without migration 0003, for example, every claim fails because
+  `job_attempts` does not exist (SQLSTATE 42P01), which the worker treats as an outage. Nothing is
+  lost. A check at start comes with phase 8.
 - No constraint ties `result` and `error_code` to the status: `GET /jobs/{id}` derives both fields
   from the status alone, and only the worker's own updates keep the columns consistent. A
   `failed` row without an error code shows `failure: null`, and a code this version does not know

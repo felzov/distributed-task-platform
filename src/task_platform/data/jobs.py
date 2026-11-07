@@ -115,8 +115,10 @@ async def mark_dispatched(session: AsyncSession, job_ids: list[uuid.UUID]) -> li
     return list(await session.scalars(statement))
 
 
-# attempts (the claimed attempt, used to fence later writes), type, payload_version, payload
-ClaimedJobRow = Row[int, str, int, dict[str, Any]]
+# attempts (the claimed attempt, used to fence later writes), max_attempts (the job's own budget,
+# for the retry decision: never the current setting, which may have changed since submission),
+# type, payload_version, payload
+ClaimedJobRow = Row[int, int, str, int, dict[str, Any]]
 
 
 async def claim_job(
@@ -129,6 +131,9 @@ async def claim_job(
     the second waits for the first's row lock and then finds the job no longer `queued`. A `queued`
     job with no attempts left also returns None instead of breaking the attempts CHECK. So does an
     unknown job: a caller that treats that case differently (ADR 0004) has to look the job up.
+
+    A caller that gets a row opens that attempt's history row (`open_attempt`) in the same
+    transaction, so every committed claim has one (ADR 0005 decision 5).
     """
     statement = (
         update(Job)
@@ -148,7 +153,7 @@ async def claim_job(
             updated_at=func.now(),
         )
         # The handler needs the payload. Result rows are logged at DEBUG (limitation, phase 8).
-        .returning(Job.attempts, Job.type, Job.payload_version, Job.payload)
+        .returning(Job.attempts, Job.max_attempts, Job.type, Job.payload_version, Job.payload)
     )
     return (await session.execute(statement)).one_or_none()
 
@@ -156,9 +161,13 @@ async def claim_job(
 async def mark_succeeded(
     session: AsyncSession, job_id: uuid.UUID, *, claimed_attempt: int, result: dict[str, Any]
 ) -> bool:
-    """Finish a claimed attempt as `succeeded`; False if that attempt is no longer current."""
+    """Finish a claimed attempt as `succeeded`; False if that attempt is no longer current.
+
+    Clears the code an earlier attempt's failure left on the job: the job did not fail, and the
+    failed attempts keep their codes in `job_attempts` (ADR 0005 decision 6).
+    """
     statement = _fenced_finish(job_id, claimed_attempt).values(
-        status=JobStatus.SUCCEEDED, result=result
+        status=JobStatus.SUCCEEDED, result=result, error_code=None
     )
     return (await session.scalar(statement)) is not None
 
@@ -173,10 +182,42 @@ async def mark_failed(
     return (await session.scalar(statement)) is not None
 
 
+async def mark_retry(
+    session: AsyncSession,
+    job_id: uuid.UUID,
+    *,
+    claimed_attempt: int,
+    error_code: FailureCode,
+    delay_s: float,
+) -> bool:
+    """Requeue a claimed attempt that failed, due `delay_s` from now (ADR 0005 decision 4).
+
+    False if that attempt is no longer current, or if it was the job's last: a requeued job always
+    has an attempt left to be claimed with. The dispatcher publishes it again once it is due.
+    """
+    statement = (
+        _fenced_finish(job_id, claimed_attempt)
+        # The claim checks the same budget, but a requeue that broke it would leave a queued job
+        # no claim can take.
+        .where(Job.attempts < Job.max_attempts)
+        .values(
+            status=JobStatus.QUEUED,
+            # The job keeps its last failure's code while it waits (ADR 0005 decision 6).
+            error_code=error_code,
+            # A duration from the caller, a timestamp from PostgreSQL's clock (ADR 0001 decision 9).
+            available_at=func.now() + timedelta(seconds=delay_s),
+            # Unpublished again, so the dispatcher's select finds it once it is due.
+            dispatched_at=None,
+        )
+    )
+    return (await session.scalar(statement)) is not None
+
+
 def _fenced_finish(job_id: uuid.UUID, claimed_attempt: int) -> ReturningUpdate[tuple[uuid.UUID]]:
     # Fenced (ADR 0001 decision 7): if the job was recovered and claimed again, or this attempt
-    # already finished, no row matches and the stale write is discarded. The callers add their own
-    # columns; UPDATE merges repeated .values().
+    # already finished, no row matches and the stale write is discarded. Used by every write that
+    # ends an attempt, a retry included. The callers add their own columns and conditions; UPDATE
+    # merges repeated .values() and .where().
     return (
         update(Job)
         .where(Job.id == job_id, Job.status == JobStatus.RUNNING, Job.attempts == claimed_attempt)

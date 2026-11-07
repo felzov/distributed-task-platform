@@ -75,6 +75,8 @@ def returning(outcome: Outcome) -> Any:
         (Outcome.NOT_CLAIMED, ("ack", None)),
         (Outcome.CLAIM_REJECTED, ("ack", None)),
         (Outcome.SUCCEEDED, ("ack", None)),
+        # The job is queued again in the database; the dispatcher publishes a new message.
+        (Outcome.RETRY_SCHEDULED, ("ack", None)),
         (Outcome.FAILED, ("ack", None)),
         (Outcome.STALE, ("ack", None)),
         (Outcome.FINISH_UNAVAILABLE, ("nack", True)),
@@ -101,6 +103,7 @@ def test_every_outcome_has_an_answer_in_the_table() -> None:
         Outcome.CLAIM_REJECTED,
         Outcome.CLAIM_UNAVAILABLE,
         Outcome.SUCCEEDED,
+        Outcome.RETRY_SCHEDULED,
         Outcome.FAILED,
         Outcome.STALE,
         Outcome.FINISH_UNAVAILABLE,

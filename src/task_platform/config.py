@@ -87,6 +87,12 @@ class BrokerSettings(Settings):
     # decision 6). The worker holds the message unacknowledged meanwhile, for the claim's own
     # timeouts plus this wait, so it is capped below RabbitMQ's default consumer_timeout (30 min).
     worker_db_error_backoff_s: float = Field(default=5.0, gt=0, lt=1800)
+    # Backoff before a retryable failure is tried again (ADR 0005 decision 3): after attempt n,
+    # a random share of min(retry_max_delay_s, retry_base_delay_s * 2^(n-1)). Placeholders, not
+    # measured. ADR 0005 decision 4 acks the message before the wait, so consumer_timeout does not
+    # bound it; the one-day cap keeps available_at far inside PostgreSQL's timestamp range.
+    retry_base_delay_s: float = Field(default=2.0, gt=0)
+    retry_max_delay_s: float = Field(default=300.0, gt=0, le=86400)
 
     @model_validator(mode="after")
     def _publish_timeout_within_statement_timeout(self) -> Self:
@@ -104,6 +110,13 @@ class BrokerSettings(Settings):
         # have given the job to another worker (ADR 0004 decision 8).
         if self.handler_timeout_s >= self.lease_duration_s:
             raise ValueError("handler_timeout_s must be shorter than lease_duration_s")
+        return self
+
+    @model_validator(mode="after")
+    def _retry_base_within_cap(self) -> Self:
+        # Otherwise the cap would shorten even the first wait. Also rejects an infinite base.
+        if self.retry_base_delay_s > self.retry_max_delay_s:
+            raise ValueError("retry_base_delay_s must not exceed retry_max_delay_s")
         return self
 
     @field_validator("jobs_queue_name")
