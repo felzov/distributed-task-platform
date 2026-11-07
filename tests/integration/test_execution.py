@@ -6,7 +6,7 @@ import contextlib
 import json
 import logging
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -16,8 +16,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from task_platform.config import BrokerSettings
 from task_platform.data.db import create_db_engine
-from task_platform.domain import job_status
+from task_platform.domain import job_status, retries
 from task_platform.domain.errors import InvalidTransitionError
+from task_platform.domain.failures import FailureCode
 from task_platform.domain.job_status import JobStatus
 from task_platform.domain.payloads import NOTIFICATION_SEND, PayloadModel
 from task_platform.services.execution import ClaimedJob, Handler, Outcome, execute_job
@@ -301,7 +302,8 @@ async def test_a_handler_error_fails_the_job_without_its_text(
     caplog: pytest.LogCaptureFixture,
     handler: Handler,
 ) -> None:
-    job_id = await insert_due_job(engine)
+    # The job's only attempt, so the retryable code fails it (retries are tested below).
+    job_id = await insert_due_job(engine, max_attempts=1)
 
     outcome = await execute_job(sessions, job_id, {NOTIFICATION_SEND: handler}, settings)
 
@@ -339,7 +341,7 @@ async def test_a_handler_over_its_timeout_is_cancelled_and_fails_the_job(
             raise
         raise AssertionError("unreachable")
 
-    job_id = await insert_due_job(engine)
+    job_id = await insert_due_job(engine, max_attempts=1)
 
     async with asyncio.timeout(5):
         outcome = await execute_job(sessions, job_id, {NOTIFICATION_SEND: hangs}, settings)
@@ -367,7 +369,7 @@ async def test_a_handler_that_returns_after_its_timeout_still_fails_the_job(
             await asyncio.Event().wait()
         return {"late": True}
 
-    job_id = await insert_due_job(engine)
+    job_id = await insert_due_job(engine, max_attempts=1)
 
     async with asyncio.timeout(5):
         outcome = await execute_job(
@@ -378,6 +380,302 @@ async def test_a_handler_that_returns_after_its_timeout_still_fails_the_job(
     row = await job_row(engine, job_id)
     assert (row["error_code"], row["result"]) == ("handler_timeout", None)
     assert f"job {job_id} attempt 1 failed: handler_timeout (returned after" in caplog.text
+
+
+# Retries (ADR 0005)
+
+
+def fixed(value: float) -> Callable[[], float]:
+    return lambda: value
+
+
+async def raises(
+    session_factory: async_sessionmaker[AsyncSession], job: ClaimedJob, payload: PayloadModel
+) -> dict[str, Any]:
+    raise RuntimeError("provider unavailable")
+
+
+@pytest.mark.parametrize(
+    ("seeded_attempts", "jitter", "delay"),
+    [
+        # Ceiling after attempt n: min(cap, base * 2^(n-1)), here base 2 s and cap 300 s.
+        pytest.param(0, 0.5, timedelta(seconds=1), id="attempt 1: half of 2 s"),
+        pytest.param(2, 0.25, timedelta(seconds=2), id="attempt 3: a quarter of 8 s"),
+        pytest.param(0, 0.0, timedelta(0), id="jitter 0: due at once"),
+    ],
+)
+async def test_a_retryable_failure_with_attempts_left_is_retried(
+    engine: AsyncEngine,
+    settings: BrokerSettings,
+    sessions: async_sessionmaker[AsyncSession],
+    caplog: pytest.LogCaptureFixture,
+    seeded_attempts: int,
+    jitter: float,
+    delay: timedelta,
+) -> None:
+    caplog.set_level(logging.INFO, logger="task_platform")
+    job_id = await insert_due_job(engine, attempts=seeded_attempts, dispatched_at=datetime.now(UTC))
+    attempt = seeded_attempts + 1
+    settings = settings.model_copy(update={"retry_base_delay_s": 2.0, "retry_max_delay_s": 300.0})
+
+    outcome = await execute_job(
+        sessions,
+        job_id,
+        {NOTIFICATION_SEND: raises_with_payload_text},
+        settings,
+        jitter=fixed(jitter),
+    )
+
+    assert outcome == Outcome.RETRY_SCHEDULED
+    row = await job_row(engine, job_id)
+    assert (row["status"], row["attempts"], row["error_code"]) == (
+        "queued",
+        attempt,
+        "handler_error",
+    )
+    assert row["available_at"] - row["updated_at"] == delay
+    assert (row["dispatched_at"], row["lease_expires_at"], row["result"]) == (None, None, None)
+    # The attempt is closed as failed, the same as a final failure (AttemptOutcome.FAILED).
+    [*_, last] = await attempts(engine, job_id)
+    assert (last["attempt"], last["outcome"], last["error_code"]) == (
+        attempt,
+        "failed",
+        "handler_error",
+    )
+    assert last["finished_at"] == row["updated_at"]
+    assert (
+        f"job {job_id} attempt {attempt} failed with handler_error;"
+        f" retry in {delay.total_seconds():.3f} s"
+    ) in caplog.text
+    # Criterion 13 on the retry path: neither the rows (besides the job's payload) nor the logs
+    # at INFO and above hold the exception's text.
+    del row["payload"]
+    assert SENTINEL not in json.dumps([row, last], default=str)
+    assert_no_sentinel(caplog)
+
+
+async def test_a_handler_timeout_is_retried_within_the_cap(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    test_database_url: str,
+) -> None:
+    # The other retryable code, past the cap: after attempt 3 the ceiling is min(3 s, 2 s * 4).
+    settings = make_test_broker_settings(
+        test_database_url,
+        UNREACHABLE_BROKER_URL,
+        handler_timeout_s=0.1,
+        lease_duration_s=10,
+        retry_base_delay_s=2.0,
+        retry_max_delay_s=3.0,
+    )
+
+    async def hangs(
+        session_factory: async_sessionmaker[AsyncSession], job: ClaimedJob, payload: PayloadModel
+    ) -> dict[str, Any]:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    job_id = await insert_due_job(engine, attempts=2)
+
+    async with asyncio.timeout(5):
+        outcome = await execute_job(
+            sessions, job_id, {NOTIFICATION_SEND: hangs}, settings, jitter=fixed(0.5)
+        )
+
+    assert outcome == Outcome.RETRY_SCHEDULED
+    row = await job_row(engine, job_id)
+    assert (row["status"], row["attempts"], row["error_code"]) == ("queued", 3, "handler_timeout")
+    assert row["available_at"] - row["updated_at"] == timedelta(seconds=1.5)
+    [last] = await attempts(engine, job_id)
+    assert (last["attempt"], last["outcome"], last["error_code"]) == (
+        3,
+        "failed",
+        "handler_timeout",
+    )
+
+
+@pytest.mark.parametrize(
+    ("job_budget", "setting", "expected"),
+    [
+        # Submitted with 2 attempts; the setting for new jobs now says 5 and must not count.
+        pytest.param(2, 5, Outcome.FAILED, id="job budget below the setting"),
+        # Submitted with 5 attempts; the setting now says 1 and must not count either.
+        pytest.param(5, 1, Outcome.RETRY_SCHEDULED, id="job budget above the setting"),
+    ],
+)
+async def test_the_retry_uses_the_jobs_own_attempt_budget(
+    engine: AsyncEngine,
+    settings: BrokerSettings,
+    sessions: async_sessionmaker[AsyncSession],
+    job_budget: int,
+    setting: int,
+    expected: Outcome,
+) -> None:
+    job_id = await insert_due_job(engine, attempts=1, max_attempts=job_budget)
+    settings = settings.model_copy(update={"default_max_attempts": setting})
+
+    outcome = await execute_job(
+        sessions, job_id, {NOTIFICATION_SEND: raises}, settings, jitter=fixed(0.0)
+    )
+
+    assert outcome == expected
+    row = await job_row(engine, job_id)
+    status = "failed" if expected == Outcome.FAILED else "queued"
+    assert (row["status"], row["attempts"], row["error_code"]) == (status, 2, "handler_error")
+
+
+async def test_without_a_jitter_each_retry_draws_its_own_delay(
+    engine: AsyncEngine, settings: BrokerSettings, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    # The worker passes no jitter: random.random() decides, within [0, ceiling). Two jobs that
+    # failed together must not retry together, which a constant jitter would make them do. Odds of
+    # a false failure: two equal draws, or one of 0.0, at microsecond resolution over 60 s, ~1e-8.
+    settings = settings.model_copy(update={"retry_base_delay_s": 60.0, "retry_max_delay_s": 300.0})
+    delays = []
+    for _ in range(2):
+        job_id = await insert_due_job(engine)
+        assert await execute_job(sessions, job_id, {NOTIFICATION_SEND: raises}, settings) == (
+            Outcome.RETRY_SCHEDULED
+        )
+        row = await job_row(engine, job_id)
+        delays.append(row["available_at"] - row["updated_at"])
+
+    assert all(timedelta(0) < delay < timedelta(seconds=60) for delay in delays)
+    assert delays[0] != delays[1]
+
+
+async def test_a_retryable_failure_on_the_last_attempt_fails_the_job(
+    engine: AsyncEngine, settings: BrokerSettings, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    job_id = await insert_due_job(engine, attempts=4, max_attempts=5)
+
+    outcome = await execute_job(
+        sessions, job_id, {NOTIFICATION_SEND: raises}, settings, jitter=fixed(0.5)
+    )
+
+    assert outcome == Outcome.FAILED
+    row = await job_row(engine, job_id)
+    assert (row["status"], row["attempts"], row["error_code"]) == ("failed", 5, "handler_error")
+    assert row["lease_expires_at"] is None
+    [attempt] = await attempts(engine, job_id)
+    assert (attempt["attempt"], attempt["outcome"]) == (5, "failed")
+
+
+@pytest.mark.parametrize(
+    ("jitter", "retryable", "error"),
+    [
+        pytest.param(1.0, None, "builtins.ValueError", id="jitter outside [0, 1)"),
+        pytest.param(0.5, {}, "builtins.KeyError", id="code missing from RETRYABLE"),
+    ],
+)
+async def test_a_retry_decision_that_cannot_be_made_fails_the_job(
+    engine: AsyncEngine,
+    settings: BrokerSettings,
+    sessions: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    jitter: float,
+    retryable: dict[FailureCode, bool] | None,
+    error: str,
+) -> None:
+    # A bug in the decision must not leave the job running: it fails, with its real code.
+    if retryable is not None:
+        monkeypatch.setattr(retries, "RETRYABLE", retryable)
+    job_id = await insert_due_job(engine)
+
+    outcome = await execute_job(
+        sessions, job_id, {NOTIFICATION_SEND: raises}, settings, jitter=fixed(jitter)
+    )
+
+    assert outcome == Outcome.FAILED
+    row = await job_row(engine, job_id)
+    assert (row["status"], row["error_code"], row["lease_expires_at"]) == (
+        "failed",
+        "handler_error",
+        None,
+    )
+    [attempt] = await attempts(engine, job_id)
+    assert (attempt["outcome"], attempt["error_code"]) == ("failed", "handler_error")
+    [record] = [r for r in caplog.records if "no retry decision" in r.getMessage()]
+    assert record.levelno == logging.ERROR
+    assert record.getMessage() == (
+        f"job {job_id} attempt 1 of 5: no retry decision for handler_error ({error}); the job fails"
+    )
+
+
+async def test_a_retry_refused_by_a_lowered_budget_fails_the_job(
+    engine: AsyncEngine,
+    settings: BrokerSettings,
+    sessions: async_sessionmaker[AsyncSession],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The decision used the budget from the claim; meanwhile the row's budget was cut to the
+    # attempt that is running (by hand: no code changes it), so mark_retry's own condition refuses
+    # the requeue. The job fails instead of staying running (ADR 0005 decision 2).
+    job_id = await insert_due_job(engine)
+
+    async def budget_cut_then_raises(
+        session_factory: async_sessionmaker[AsyncSession], job: ClaimedJob, payload: PayloadModel
+    ) -> dict[str, Any]:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("UPDATE jobs SET max_attempts = attempts WHERE id = :id"), {"id": job.id}
+            )
+        raise RuntimeError("provider unavailable")
+
+    outcome = await execute_job(
+        sessions, job_id, {NOTIFICATION_SEND: budget_cut_then_raises}, settings, jitter=fixed(0.5)
+    )
+
+    assert outcome == Outcome.FAILED
+    row = await job_row(engine, job_id)
+    assert (row["status"], row["attempts"], row["error_code"], row["lease_expires_at"]) == (
+        "failed",
+        1,
+        "handler_error",
+        None,
+    )
+    [attempt] = await attempts(engine, job_id)
+    assert (attempt["outcome"], attempt["error_code"]) == ("failed", "handler_error")
+    [record] = [r for r in caplog.records if "was not requeued" in r.getMessage()]
+    assert record.levelno == logging.ERROR
+    assert record.getMessage() == (
+        f"job {job_id} attempt 1 was not requeued: its max_attempts was lowered after the claim;"
+        " the job fails with handler_error"
+    )
+    assert "is no longer current" not in caplog.text
+    assert "retry in" not in caplog.text
+
+
+async def test_a_stale_attempts_retry_is_discarded(
+    engine: AsyncEngine,
+    settings: BrokerSettings,
+    sessions: async_sessionmaker[AsyncSession],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A newer attempt owns the job: neither the retry nor the fallback to a failure applies.
+    job_id = await insert_due_job(engine)
+
+    async def overtaken_then_raises(
+        session_factory: async_sessionmaker[AsyncSession], job: ClaimedJob, payload: PayloadModel
+    ) -> dict[str, Any]:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("UPDATE jobs SET attempts = attempts + 1 WHERE id = :id"), {"id": job.id}
+            )
+        raise RuntimeError("provider unavailable")
+
+    outcome = await execute_job(
+        sessions, job_id, {NOTIFICATION_SEND: overtaken_then_raises}, settings, jitter=fixed(0.5)
+    )
+
+    assert outcome == Outcome.STALE
+    row = await job_row(engine, job_id)
+    assert (row["status"], row["attempts"], row["error_code"]) == ("running", 2, None)
+    [attempt] = await attempts(engine, job_id)
+    assert (attempt["attempt"], attempt["outcome"]) == (1, None)
+    assert f"job {job_id} attempt 1 is no longer current" in caplog.text
+    assert "was not requeued" not in caplog.text
 
 
 # The final update
@@ -478,20 +776,28 @@ async def test_a_later_attempt_closes_its_own_row(
     assert "had no open attempt row" not in caplog.text
 
 
+JOB_ROW_LOCK = "SELECT 1 FROM jobs WHERE id = :id FOR UPDATE"
+ATTEMPT_ROW_LOCK = "SELECT 1 FROM job_attempts WHERE job_id = :id FOR UPDATE"
+
+
 @pytest.mark.parametrize(
-    "lock",
+    ("lock", "fails"),
     [
         # The job's update waits past the timeout, before the attempt row is touched.
-        pytest.param("SELECT 1 FROM jobs WHERE id = :id FOR UPDATE", id="job row locked"),
+        pytest.param(JOB_ROW_LOCK, False, id="job row locked"),
         # The job's update goes through, then closing the attempt waits past the timeout: the
         # error rolls both back, so the job is not finished while its attempt stays open.
-        pytest.param(
-            "SELECT 1 FROM job_attempts WHERE job_id = :id FOR UPDATE", id="attempt row locked"
-        ),
+        pytest.param(ATTEMPT_ROW_LOCK, False, id="attempt row locked"),
+        # The same for a retry: the job is not requeued while its attempt stays open.
+        pytest.param(ATTEMPT_ROW_LOCK, True, id="attempt row locked, retry"),
     ],
 )
 async def test_a_final_update_the_database_cannot_take_leaves_the_job_running(
-    engine: AsyncEngine, test_database_url: str, caplog: pytest.LogCaptureFixture, lock: str
+    engine: AsyncEngine,
+    test_database_url: str,
+    caplog: pytest.LogCaptureFixture,
+    lock: str,
+    fails: bool,
 ) -> None:
     # Another transaction holds a row lock past the worker's statement timeout.
     settings = make_test_broker_settings(
@@ -509,11 +815,17 @@ async def test_a_final_update_the_database_cannot_take_leaves_the_job_running(
     ) -> dict[str, Any]:
         await holder.begin()
         await holder.execute(text(lock), {"id": job.id})
+        if fails:
+            raise RuntimeError("provider unavailable")
         return {"done": True}
 
     try:
         outcome = await execute_job(
-            async_sessionmaker(worker_engine), job_id, {NOTIFICATION_SEND: locks_the_row}, settings
+            async_sessionmaker(worker_engine),
+            job_id,
+            {NOTIFICATION_SEND: locks_the_row},
+            settings,
+            jitter=fixed(0.5),
         )
     finally:
         await holder.close()
@@ -521,7 +833,12 @@ async def test_a_final_update_the_database_cannot_take_leaves_the_job_running(
 
     assert outcome == Outcome.FINISH_UNAVAILABLE
     row = await job_row(engine, job_id)
-    assert (row["status"], row["attempts"], row["result"]) == ("running", 1, None)
+    assert (row["status"], row["attempts"], row["result"], row["error_code"]) == (
+        "running",
+        1,
+        None,
+        None,
+    )
     [attempt] = await attempts(engine, job_id)
     assert (attempt["finished_at"], attempt["outcome"]) == (None, None)
     # 57014: query_canceled by the statement timeout.
@@ -591,10 +908,16 @@ async def test_a_claim_the_database_rejects_for_this_job_is_not_retried(
 
 
 @pytest.mark.parametrize(
-    ("forbidden", "status_after"),
+    ("forbidden", "handlers", "status_after"),
     [
-        pytest.param((JobStatus.QUEUED, JobStatus.RUNNING), "queued", id="claim"),
-        pytest.param((JobStatus.RUNNING, JobStatus.SUCCEEDED), "running", id="finish"),
+        pytest.param((JobStatus.QUEUED, JobStatus.RUNNING), HANDLERS, "queued", id="claim"),
+        pytest.param((JobStatus.RUNNING, JobStatus.SUCCEEDED), HANDLERS, "running", id="finish"),
+        pytest.param(
+            (JobStatus.RUNNING, JobStatus.QUEUED),
+            {NOTIFICATION_SEND: raises},
+            "running",
+            id="retry",
+        ),
     ],
 )
 async def test_every_change_is_checked_against_the_transition_table(
@@ -603,6 +926,7 @@ async def test_every_change_is_checked_against_the_transition_table(
     settings: BrokerSettings,
     monkeypatch: pytest.MonkeyPatch,
     forbidden: tuple[JobStatus, JobStatus],
+    handlers: Mapping[str, Handler],
     status_after: str,
 ) -> None:
     # If ADR 0001's table stopped allowing a change, the service would refuse to make it.
@@ -614,5 +938,5 @@ async def test_every_change_is_checked_against_the_transition_table(
     job_id = await insert_due_job(engine)
 
     with pytest.raises(InvalidTransitionError):
-        await execute_job(sessions, job_id, HANDLERS, settings)
+        await execute_job(sessions, job_id, handlers, settings)
     assert (await job_row(engine, job_id))["status"] == status_after
