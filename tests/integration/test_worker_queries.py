@@ -1,4 +1,4 @@
-"""The worker's queries: the claim, the fenced finish and the fake provider's record (ADR 0001)."""
+"""The worker's queries: claim, fenced finish or retry, the fake provider's record (ADR 0001)."""
 
 import asyncio
 import uuid
@@ -11,7 +11,13 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from task_platform.data.fake_notifications import insert_fake_notification
-from task_platform.data.jobs import ClaimedJobRow, claim_job, mark_failed, mark_succeeded
+from task_platform.data.jobs import (
+    ClaimedJobRow,
+    claim_job,
+    mark_failed,
+    mark_retry,
+    mark_succeeded,
+)
 from task_platform.domain.failures import FailureCode
 from tests.integration.rows import insert_job
 
@@ -23,7 +29,7 @@ FUTURE = datetime.now(UTC) + timedelta(hours=3)
 LEASE_S = 30.0
 RESULT = {"delivered": True}
 
-# succeed or fail: (engine, job id, claimed attempt) -> whether the write applied.
+# succeed, fail or retry: (engine, job id, claimed attempt) -> whether the write applied.
 Finish = Callable[[AsyncEngine, uuid.UUID, int], Awaitable[bool]]
 
 
@@ -41,6 +47,19 @@ async def fail(engine: AsyncEngine, job_id: uuid.UUID, attempt: int) -> bool:
     async with async_sessionmaker(engine).begin() as session:
         return await mark_failed(
             session, job_id, claimed_attempt=attempt, error_code=FailureCode.INVALID_PAYLOAD
+        )
+
+
+async def retry(
+    engine: AsyncEngine,
+    job_id: uuid.UUID,
+    attempt: int,
+    delay_s: float = 60.0,
+    error_code: FailureCode = FailureCode.HANDLER_ERROR,
+) -> bool:
+    async with async_sessionmaker(engine).begin() as session:
+        return await mark_retry(
+            session, job_id, claimed_attempt=attempt, error_code=error_code, delay_s=delay_s
         )
 
 
@@ -216,7 +235,7 @@ async def test_mark_failed_finishes_the_attempt(engine: AsyncEngine) -> None:
     assert row["updated_at"] > claimed_at
 
 
-@pytest.mark.parametrize("finish", [succeed, fail])
+@pytest.mark.parametrize("finish", [succeed, fail, retry])
 async def test_a_stale_attempt_cannot_finish_a_newer_one(
     engine: AsyncEngine, finish: Finish
 ) -> None:
@@ -234,7 +253,7 @@ async def test_a_stale_attempt_cannot_finish_a_newer_one(
     assert await finish(engine, job["id"], 2)
 
 
-@pytest.mark.parametrize("second_finish", [succeed, fail])
+@pytest.mark.parametrize("second_finish", [succeed, fail, retry])
 async def test_a_finished_attempt_cannot_finish_again(
     engine: AsyncEngine, second_finish: Finish
 ) -> None:
@@ -247,7 +266,7 @@ async def test_a_finished_attempt_cannot_finish_again(
     assert await job_row(engine, job["id"]) == finished
 
 
-@pytest.mark.parametrize("finish", [succeed, fail])
+@pytest.mark.parametrize("finish", [succeed, fail, retry])
 async def test_a_job_that_was_never_claimed_cannot_finish(
     engine: AsyncEngine, finish: Finish
 ) -> None:
@@ -258,8 +277,76 @@ async def test_a_job_that_was_never_claimed_cannot_finish(
     assert await job_row(engine, job["id"]) == job
 
 
-async def test_finishing_an_unknown_job_returns_false(engine: AsyncEngine) -> None:
-    assert not await succeed(engine, uuid.uuid4(), attempt=1)
+@pytest.mark.parametrize("finish", [succeed, fail, retry])
+async def test_finishing_an_unknown_job_returns_false(engine: AsyncEngine, finish: Finish) -> None:
+    assert not await finish(engine, uuid.uuid4(), 1)
+
+
+# The retry
+
+
+@pytest.mark.parametrize("delay_s", [0.0, 1.5, 300.0])
+async def test_mark_retry_requeues_the_job_after_its_delay(
+    engine: AsyncEngine, delay_s: float
+) -> None:
+    # Published and claimed, as a delivered job is.
+    job = await insert_job(engine, dispatched_at=PAST)
+    await claim(engine, job["id"])
+    claimed_at = (await job_row(engine, job["id"]))["updated_at"]
+
+    assert await retry(engine, job["id"], attempt=1, delay_s=delay_s)
+
+    row = await job_row(engine, job["id"])
+    assert row["status"] == "queued"
+    assert row["error_code"] == "handler_error"
+    # Due from PostgreSQL's clock in the retry's own transaction, to the microsecond.
+    assert row["available_at"] - row["updated_at"] == timedelta(seconds=delay_s)
+    assert row["updated_at"] > claimed_at
+    # Unpublished and unleased: the dispatcher publishes it again once it is due.
+    assert (row["dispatched_at"], row["lease_expires_at"]) == (None, None)
+    # The attempt that failed stays counted, so the next claim is attempt 2.
+    assert (row["attempts"], row["result"]) == (1, None)
+
+
+async def test_a_retry_replaces_an_earlier_failures_code(engine: AsyncEngine) -> None:
+    # The job keeps its last failure's code while it waits (ADR 0005 decision 6), not its first.
+    job = await insert_job(engine, attempts=1, error_code="handler_error")
+    await claim(engine, job["id"])
+
+    assert await retry(engine, job["id"], attempt=2, error_code=FailureCode.HANDLER_TIMEOUT)
+
+    assert (await job_row(engine, job["id"]))["error_code"] == "handler_timeout"
+
+
+async def test_a_requeued_job_is_claimed_again_as_the_next_attempt(engine: AsyncEngine) -> None:
+    job = await insert_job(engine)
+    await claim(engine, job["id"])
+    assert await retry(engine, job["id"], attempt=1, delay_s=0.0)
+
+    claimed = await claim(engine, job["id"])
+
+    assert claimed is not None
+    assert claimed.attempts == 2
+
+
+async def test_a_requeued_job_waits_for_its_delay(engine: AsyncEngine) -> None:
+    job = await insert_job(engine)
+    await claim(engine, job["id"])
+    assert await retry(engine, job["id"], attempt=1, delay_s=3600.0)
+
+    assert await claim(engine, job["id"]) is None
+
+
+async def test_the_last_attempt_cannot_be_requeued(engine: AsyncEngine) -> None:
+    # attempts reached max_attempts: a queued job no claim could take. Only the budget refuses this
+    # write; status and attempt match.
+    job = await insert_job(engine, max_attempts=2, attempts=1)
+    await claim(engine, job["id"])
+    running = await job_row(engine, job["id"])
+    assert running["attempts"] == 2
+
+    assert not await retry(engine, job["id"], attempt=2)
+    assert await job_row(engine, job["id"]) == running
 
 
 # The fake provider's record

@@ -178,10 +178,42 @@ async def mark_failed(
     return (await session.scalar(statement)) is not None
 
 
+async def mark_retry(
+    session: AsyncSession,
+    job_id: uuid.UUID,
+    *,
+    claimed_attempt: int,
+    error_code: FailureCode,
+    delay_s: float,
+) -> bool:
+    """Requeue a claimed attempt that failed, due `delay_s` from now (ADR 0005 decision 4).
+
+    False if that attempt is no longer current, or if it was the job's last: a requeued job always
+    has an attempt left to be claimed with. The dispatcher publishes it again once it is due.
+    """
+    statement = (
+        _fenced_finish(job_id, claimed_attempt)
+        # The claim checks the same budget, but a requeue that broke it would leave a queued job
+        # no claim can take.
+        .where(Job.attempts < Job.max_attempts)
+        .values(
+            status=JobStatus.QUEUED,
+            # The job keeps its last failure's code while it waits (ADR 0005 decision 6).
+            error_code=error_code,
+            # A duration from the caller, a timestamp from PostgreSQL's clock (ADR 0001 decision 9).
+            available_at=func.now() + timedelta(seconds=delay_s),
+            # Unpublished again, so the dispatcher's select finds it once it is due.
+            dispatched_at=None,
+        )
+    )
+    return (await session.scalar(statement)) is not None
+
+
 def _fenced_finish(job_id: uuid.UUID, claimed_attempt: int) -> ReturningUpdate[tuple[uuid.UUID]]:
     # Fenced (ADR 0001 decision 7): if the job was recovered and claimed again, or this attempt
-    # already finished, no row matches and the stale write is discarded. The callers add their own
-    # columns; UPDATE merges repeated .values().
+    # already finished, no row matches and the stale write is discarded. Used by every write that
+    # ends an attempt, a retry included. The callers add their own columns and conditions; UPDATE
+    # merges repeated .values() and .where().
     return (
         update(Job)
         .where(Job.id == job_id, Job.status == JobStatus.RUNNING, Job.attempts == claimed_attempt)
