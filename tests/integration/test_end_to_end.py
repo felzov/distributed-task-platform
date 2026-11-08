@@ -333,10 +333,14 @@ async def test_a_job_that_always_fails_stops_after_its_attempts(
             status = await wait_until(client, job_id, "failed")
             await wait_for_answers(answers, 3)
         attempts_response = await client.get(f"/jobs/{job_id}/attempts")
+        failed_response = await client.get("/jobs?status=failed")
     attempts = attempts_response.json()["attempts"]
 
     assert answers == ["ack", "ack", "ack"]
     assert (status["attempts"], status["max_attempts"]) == (3, 3)
+    # The job that ran out of attempts is the one dead letter of its kind: a failed row, listed
+    # exactly as GET /jobs/{id} shows it (ADR 0006 decision 1).
+    assert failed_response.json() == {"jobs": [status], "next_cursor": None}
     # Failed with the last attempt's code.
     assert status["failure"]["code"] == "handler_error"
     assert [(a["attempt"], a["outcome"]) for a in attempts] == [
@@ -361,4 +365,5 @@ async def test_a_job_that_always_fails_stops_after_its_attempts(
     for sentinel in (SENTINEL, ERROR_SENTINEL):
         assert sentinel not in caplog.text
         assert sentinel not in attempts_response.text
+        assert sentinel not in failed_response.text
     assert ERROR_SENTINEL not in await stored_text(engine, job_id)
