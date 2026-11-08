@@ -66,8 +66,9 @@ class BrokerSettings(Settings):
     # Sent in Connection.Tune-Ok, replacing the broker's proposal; missed heartbeats close it.
     # The AMQP field is 16 bits, and aiormq sends 0 (heartbeats off) for 65535 or more.
     broker_heartbeat_s: int = Field(default=60, ge=1, le=65534)
-    # RabbitMQ caps names at 255 bytes; ASCII only here, so that is 255 characters.
-    jobs_queue_name: str = Field(default="jobs", max_length=255, pattern=r"^[A-Za-z0-9._-]+$")
+    # RabbitMQ caps names at 255 bytes; ASCII only here, so that is 255 characters. 250 leaves room
+    # for the dead-letter queue's ".dead" suffix (ADR 0006 decision 2).
+    jobs_queue_name: str = Field(default="jobs", max_length=250, pattern=r"^[A-Za-z0-9._-]+$")
 
     # Jobs one dispatcher poll locks and publishes at once. Capped well below asyncpg's limit of
     # 32767 bind parameters per statement: marking sends one parameter per id.

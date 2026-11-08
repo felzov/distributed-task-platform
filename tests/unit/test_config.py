@@ -169,7 +169,7 @@ def test_heartbeat_above_the_amqp_range_is_rejected() -> None:
         pytest.param("amq.jobs", id="reserved prefix"),
         pytest.param("jobs queue", id="space"),
         pytest.param("jöbs", id="non-ascii"),
-        pytest.param("j" * 256, id="256 characters"),
+        pytest.param("j" * 251, id="251 characters: no room for .dead"),
     ],
 )
 def test_invalid_queue_names_are_rejected(name: str) -> None:
@@ -178,7 +178,7 @@ def test_invalid_queue_names_are_rejected(name: str) -> None:
     assert PASSWORD not in str(exc_info.value)
 
 
-@pytest.mark.parametrize("name", ["jobs", "test-jobs-0f3a", "jobs.v1_x", "j" * 255, "amqp-jobs"])
+@pytest.mark.parametrize("name", ["jobs", "test-jobs-0f3a", "jobs.v1_x", "j" * 250, "amqp-jobs"])
 def test_valid_queue_names_are_accepted(name: str) -> None:
     result = broker_settings(database_url=URL, broker_url=BROKER_URL, jobs_queue_name=name)
     assert result.jobs_queue_name == name

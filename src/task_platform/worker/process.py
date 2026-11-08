@@ -61,8 +61,9 @@ async def handle_message(
     try:
         outcome = await execute_job(session_factory, job.job_id, handlers, settings)
     # A bug, such as a transition the domain refuses. Requeued with reject, which counts towards
-    # the delivery limit, so a job that keeps hitting it cannot hold the queue forever; its
-    # message is dropped after the limit, as for a worker that keeps crashing (ADR 0004).
+    # the delivery limit, so a job that keeps hitting it cannot hold the queue forever; past the
+    # limit its message goes to the dead-letter queue, as for a worker that keeps crashing
+    # (ADR 0004, ADR 0006).
     except Exception as exc:
         logger.error("job %s: unexpected %s", job.job_id, safe_logging.class_name(exc))
         await _settle("reject", message.reject(requeue=True))

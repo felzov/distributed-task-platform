@@ -8,7 +8,7 @@ from aio_pika.abc import AbstractRobustConnection
 from aio_pika.exceptions import ChannelPreconditionFailed, ProbableAuthenticationError
 
 from task_platform.broker.connection import connect_broker
-from task_platform.broker.topology import declare_jobs_queue
+from task_platform.broker.topology import declare_jobs_queue, jobs_queue_arguments
 from task_platform.config import BrokerSettings
 from tests.settings import UNREACHABLE_DATABASE_URL, make_test_broker_settings
 
@@ -38,11 +38,12 @@ async def test_jobs_queue_is_a_quorum_queue(
 ) -> None:
     await declare_jobs_queue(await broker_connection.channel(), broker_settings.jobs_queue_name)
 
-    # RabbitMQ compares the arguments of an existing queue: a classic declaration of the same name
-    # is refused, which shows the queue really was created as a quorum queue.
+    # RabbitMQ compares the arguments of an existing queue: a declaration that differs only in the
+    # queue type is refused, which shows the queue really was created as a quorum queue.
+    name = broker_settings.jobs_queue_name
     with pytest.raises(ChannelPreconditionFailed, match="x-queue-type"):
         await (await broker_connection.channel()).declare_queue(
-            broker_settings.jobs_queue_name, durable=True
+            name, durable=True, arguments=jobs_queue_arguments(name) | {"x-queue-type": "classic"}
         )
 
 
