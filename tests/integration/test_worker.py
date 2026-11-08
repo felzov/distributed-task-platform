@@ -16,7 +16,7 @@ from sqlalchemy import QueuePool, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from task_platform.broker.connection import connect_broker
-from task_platform.broker.topology import declare_jobs_queue
+from task_platform.broker.topology import dead_letter_queue_name, declare_jobs_queue
 from task_platform.config import BrokerSettings
 from task_platform.data.db import create_db_engine
 from task_platform.domain.messages import encode_job_message
@@ -138,6 +138,17 @@ async def take(connection: AbstractRobustConnection, queue_name: str) -> Abstrac
         return message
 
 
+async def take_dead_letter(
+    connection: AbstractRobustConnection, queue_name: str
+) -> AbstractIncomingMessage:
+    """The one message in the queue's dead-letter queue, once RabbitMQ has moved it there."""
+    dead = dead_letter_queue_name(queue_name)
+    async with asyncio.timeout(10):
+        while await ready_messages(connection, dead) != 1:
+            await asyncio.sleep(0.05)
+    return await take(connection, dead)
+
+
 async def wait_for(answers: list[str], count: int) -> None:
     async with asyncio.timeout(10):
         while len(answers) < count:
@@ -202,10 +213,14 @@ async def test_unparsable_and_unknown_messages_leave_the_queue_and_the_worker_go
     async with worker(broker_connection, sessions, settings):
         await wait_for(answers, 3)
 
-    # Rejected without requeue (dropped while no dead-letter exchange exists), then acked twice.
+    # Rejected without requeue, so RabbitMQ moves it to the dead-letter queue (ADR 0006); the two
+    # parsable messages are acked.
     assert answers == ["reject", "ack", "ack"]
     assert (await job_row(engine, job_id))["status"] == "succeeded"
     assert await ready_messages(broker_connection, settings.jobs_queue_name) == 0
+    dead = await take_dead_letter(broker_connection, settings.jobs_queue_name)
+    assert dead.body == b"not json"
+    assert (dead.headers or {}).get("x-first-death-reason") in ("rejected", b"rejected")
 
 
 async def test_two_workers_given_one_job_twice_run_it_once_and_ack_both(
@@ -275,8 +290,13 @@ async def test_a_database_outage_keeps_the_message_without_counting_it(
     # The redelivery after a nack is not counted towards the delivery limit (ADR 0004 decision 7).
     assert delivery_counts[:2] == [0, 0]
     assert await job_row(engine, job_id) == before
-    # Still in the queue once the worker has stopped.
+    # Still in the queue once the worker has stopped, and not dead-lettered: lost and
+    # dead-lettered would look the same from the jobs queue alone.
     assert await ready_messages(broker_connection, settings.jobs_queue_name) == 1
+    assert (
+        await ready_messages(broker_connection, dead_letter_queue_name(settings.jobs_queue_name))
+        == 0
+    )
 
 
 async def test_an_unexpected_error_requeues_the_message_and_counts_it(
@@ -301,6 +321,37 @@ async def test_an_unexpected_error_requeues_the_message_and_counts_it(
     assert answers[:2] == ["reject", "reject"]
     # Counted, so the delivery limit (20) ends it instead of an endless loop.
     assert delivery_counts[:2] == [0, 1]
+
+
+async def test_a_message_that_keeps_hitting_a_bug_is_dead_lettered_past_the_limit(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    broker_connection: AbstractRobustConnection,
+    settings: BrokerSettings,
+    answers: list[str],
+    delivery_counts: list[object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The real queue and its default limit of 20, not a lowered one: the 21st return goes over it
+    # and RabbitMQ moves the message to the dead-letter queue (ADR 0006 decision 5).
+    async def raises(*args: Any) -> Outcome:
+        raise RuntimeError("a bug")
+
+    monkeypatch.setattr(process, "execute_job", raises)
+    job_id = await insert_due_job(engine)
+    before = await job_row(engine, job_id)
+    await publish(broker_connection, settings.jobs_queue_name, encode_job_message(job_id))
+
+    async with worker(broker_connection, sessions, settings):
+        dead = await take_dead_letter(broker_connection, settings.jobs_queue_name)
+
+    assert answers == ["reject"] * 21
+    assert delivery_counts == list(range(21))
+    assert dead.body == encode_job_message(job_id)
+    assert (dead.headers or {}).get("x-first-death-reason") in ("delivery_limit", b"delivery_limit")
+    assert await ready_messages(broker_connection, settings.jobs_queue_name) == 0
+    # The broker never decides the job's state: it waits for phase 8 recovery, as before.
+    assert await job_row(engine, job_id) == before
 
 
 async def test_a_message_held_by_a_stopped_worker_comes_back_counted(

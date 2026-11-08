@@ -1,6 +1,6 @@
 """How the worker answers the broker for each outcome (ADR 0004 decision 6), with a fake message.
 
-The real broker's side of each answer (requeued, dropped, counted) is in
+The real broker's side of each answer (requeued, dead-lettered, counted) is in
 tests/integration/test_worker.py.
 """
 
