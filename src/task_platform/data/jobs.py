@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import ColumnElement, Row, func, insert, literal, select, update
+from sqlalchemy import ColumnElement, Row, func, insert, literal, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.dml import ReturningUpdate
 
@@ -83,6 +83,41 @@ def _has_status(status: JobStatus) -> ColumnElement[bool]:
     never input.
     """
     return Job.status == literal(status.value, literal_execute=True)
+
+
+async def select_failed_jobs(
+    session: AsyncSession, *, limit: int, before: tuple[datetime, uuid.UUID] | None = None
+) -> list[JobStateRow]:
+    """Failed jobs, newest first by (updated_at, id); only those before `before`, if given.
+
+    Keyset pagination: pass the last row's (updated_at, id) to get the next page. A failed job is
+    terminal, so its updated_at never changes and a page boundary cannot move (ADR 0001).
+    """
+    # The same columns as select_job, never `payload`. ix_jobs_failed (migration 0004) serves both
+    # the condition and the order.
+    statement = (
+        select(
+            Job.id,
+            Job.type,
+            Job.payload_version,
+            Job.status,
+            Job.attempts,
+            Job.max_attempts,
+            Job.available_at,
+            Job.created_at,
+            Job.updated_at,
+            Job.error_code,
+            Job.result,
+        )
+        .where(_has_status(JobStatus.FAILED))
+        .order_by(Job.updated_at.desc(), Job.id.desc())
+        .limit(limit)
+    )
+    if before is not None:
+        # A row comparison, so jobs that failed in the same microsecond are split by id, never
+        # skipped or repeated.
+        statement = statement.where(tuple_(Job.updated_at, Job.id) < tuple_(*before))
+    return list((await session.execute(statement)).all())
 
 
 async def select_due_job_ids(session: AsyncSession, *, limit: int) -> list[uuid.UUID]:
