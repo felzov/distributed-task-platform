@@ -28,7 +28,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.engine = engine
     # expire_on_commit=False: reading an attribute after COMMIT must not trigger hidden I/O.
     app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
-    register_error_handlers(app)
-    app.include_router(jobs.router)
-    app.include_router(health.router)
+    routers = (jobs.router, health.router)
+    register_error_handlers(app, [route for router in routers for route in router.routes])
+    for router in routers:
+        app.include_router(router)
     return app
