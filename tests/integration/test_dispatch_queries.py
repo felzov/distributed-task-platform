@@ -10,6 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from task_platform.data.jobs import mark_dispatched, select_due_job_ids
+from tests.integration.plans import generic_plan
 from tests.integration.rows import insert_job
 
 pytestmark = pytest.mark.integration
@@ -132,3 +133,13 @@ async def test_locked_jobs_are_skipped_not_waited_for(engine: AsyncEngine) -> No
 
     # Once the holder's transaction has ended, its job is due again.
     assert await due_ids(engine) == [first["id"], second["id"]]
+
+
+async def test_the_due_jobs_query_keeps_its_index_under_a_generic_plan(engine: AsyncEngine) -> None:
+    # The dispatcher runs this every poll, so its prepared statement soon gets a generic plan.
+    # With the status bound as a parameter, that plan could not use the partial index.
+    await insert_job(engine, available_at=PAST)
+
+    plan = await generic_plan(engine, lambda session: select_due_job_ids(session, limit=10))
+
+    assert "ix_jobs_dispatch_due" in plan

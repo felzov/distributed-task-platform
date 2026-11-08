@@ -12,6 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from task_platform.broker.connection import connect_broker
+from task_platform.broker.topology import dead_letter_queue_name
 from task_platform.config import BrokerSettings, Settings
 from task_platform.data.db import create_db_engine
 from task_platform.worker import process
@@ -91,10 +92,12 @@ async def broker_connection(
         yield connection
     finally:
         # A fresh channel: the test may have left its own channels closed by the broker. Deletes
-        # only this test's queue; deleting a queue that was never declared is not an error.
+        # only this test's queues, the dead-letter queue last so that nothing waits to be
+        # dead-lettered into it; deleting a queue that was never declared is not an error.
         try:
             channel = await connection.channel()
             await channel.queue_delete(broker_settings.jobs_queue_name)
+            await channel.queue_delete(dead_letter_queue_name(broker_settings.jobs_queue_name))
         finally:
             await connection.close()
 

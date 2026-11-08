@@ -1,24 +1,32 @@
-"""`POST /jobs` (size-capped body, envelope check, then the service), `GET /jobs/{id}` and
-`GET /jobs/{id}/attempts`."""
+"""`POST /jobs` (size-capped body, envelope check, then the service), `GET /jobs?status=failed`,
+`GET /jobs/{id}` and `GET /jobs/{id}/attempts`."""
 
 import uuid
-from typing import Any, Final
+from datetime import datetime
+from typing import Annotated, Any, Final, Literal
 
-from fastapi import APIRouter, Request, Response, status
+from fastapi import APIRouter, Query, Request, Response, status
 from pydantic import ValidationError
 
+from task_platform.api.cursors import (
+    MAX_CURSOR_LENGTH,
+    InvalidCursorError,
+    decode_cursor,
+    encode_cursor,
+)
 from task_platform.api.dependencies import AppSettings, SessionFactory
 from task_platform.api.errors import DATABASE_ERROR_RESPONSES, ApiError, ApiErrorCode
 from task_platform.api.schemas import (
     AttemptBody,
     AttemptsResponse,
     ErrorResponse,
+    JobListResponse,
     JobResponse,
     SubmitJobRequest,
     SubmitJobResponse,
 )
 from task_platform.domain.payloads import safe_error_details
-from task_platform.services.jobs import get_attempts, get_job, submit_job
+from task_platform.services.jobs import get_attempts, get_job, list_failed_jobs, submit_job
 
 router = APIRouter()
 
@@ -102,6 +110,49 @@ async def post_job(
     )
     response.headers["Location"] = f"/jobs/{job.id}"
     return SubmitJobResponse(id=job.id, status=job.status)
+
+
+# Page sizes of the job list; placeholders, not measured.
+DEFAULT_PAGE_SIZE: Final = 50
+MAX_PAGE_SIZE: Final = 100
+
+
+@router.get(
+    "/jobs",
+    responses={
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": ErrorResponse},
+        **DATABASE_ERROR_RESPONSES,
+    },
+)
+async def list_jobs(
+    session_factory: SessionFactory,
+    # Named apart from fastapi's `status` module; only failed jobs can be listed so far.
+    job_status: Annotated[Literal["failed"], Query(alias="status")],
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = DEFAULT_PAGE_SIZE,
+    cursor: Annotated[str | None, Query(max_length=MAX_CURSOR_LENGTH)] = None,
+) -> JobListResponse:
+    """Failed jobs, newest first, without their payloads. Pass `next_cursor` for the next page."""
+    after = None if cursor is None else _decode_cursor(cursor)
+    page = await list_failed_jobs(session_factory, limit=limit, after=after)
+    return JobListResponse(
+        jobs=[JobResponse.model_validate(job) for job in page.jobs],
+        next_cursor=None if page.next_after is None else encode_cursor(*page.next_after),
+    )
+
+
+def _decode_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
+    # Raised outside the `except` block, so the ApiError carries no __context__ (as in
+    # parse_envelope); the detail has the same "<location>: <type>" form as FastAPI's own 422s.
+    try:
+        return decode_cursor(cursor)
+    except InvalidCursorError:
+        pass
+    raise ApiError(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        ApiErrorCode.INVALID_REQUEST,
+        "request is not valid",
+        ("query.cursor: invalid_cursor",),
+    )
 
 
 @router.get(

@@ -42,6 +42,7 @@ async def test_migrations_go_up_down_and_up_again(test_settings: Settings) -> No
         "pk_fake_notifications",
         "job_attempts",
         "pk_job_attempts",
+        "ix_jobs_failed",
     }
 
     await migrate(test_settings, "up", "head")
@@ -71,6 +72,71 @@ async def test_dispatch_index_is_partial_on_due_unpublished_jobs(test_settings: 
     assert definition is not None
     assert "(available_at)" in definition
     assert "WHERE ((status = 'queued'::text) AND (dispatched_at IS NULL))" in definition
+
+
+async def test_failed_index_is_partial_and_newest_first(test_settings: Settings) -> None:
+    await migrate(test_settings, "up", "head")
+    engine = create_db_engine(test_settings)
+    try:
+        async with engine.connect() as connection:
+            definition = await connection.scalar(
+                text("SELECT indexdef FROM pg_indexes WHERE indexname = 'ix_jobs_failed'")
+            )
+    finally:
+        await engine.dispose()
+
+    assert definition is not None
+    assert "(updated_at DESC, id DESC)" in definition
+    assert "WHERE (status = 'failed'::text)" in definition
+
+
+async def test_existing_failed_jobs_are_indexed_by_0004_and_kept_by_its_downgrade(
+    engine: AsyncEngine, test_settings: Settings
+) -> None:
+    # The index is built over the rows already there, and the downgrade drops only the index.
+    try:
+        await migrate(test_settings, "down", "0003")
+        assert "ix_jobs_failed" not in await schema_objects(test_settings)
+        async with engine.begin() as connection:
+            job_id = await connection.scalar(
+                text(
+                    "INSERT INTO jobs (type, payload_version, payload, max_attempts, status,"
+                    " attempts, error_code) VALUES ('notification.send', 1, '{}', 5, 'failed', 5,"
+                    " 'handler_error') RETURNING id"
+                )
+            )
+
+        await migrate(test_settings, "up", "0004")
+        async with engine.begin() as connection:
+            # Planner off the table scan, so the plan shows whether the index can answer the list.
+            await connection.execute(text("SET LOCAL enable_seqscan = off"))
+            plan = "\n".join(
+                await connection.scalars(
+                    text(
+                        "EXPLAIN SELECT id FROM jobs WHERE status = 'failed'"
+                        " ORDER BY updated_at DESC, id DESC LIMIT 10"
+                    )
+                )
+            )
+            listed = await connection.scalar(
+                text(
+                    "SELECT id FROM jobs WHERE status = 'failed'"
+                    " ORDER BY updated_at DESC, id DESC LIMIT 1"
+                )
+            )
+        assert "ix_jobs_failed" in plan
+        assert listed == job_id
+
+        await migrate(test_settings, "down", "0003")
+        assert "ix_jobs_failed" not in await schema_objects(test_settings)
+        async with engine.connect() as connection:
+            status = await connection.scalar(
+                text("SELECT status FROM jobs WHERE id = :id"), {"id": job_id}
+            )
+        assert status == "failed"
+    finally:
+        # Shared test database: leave it at head, as the tests above do.
+        await migrate(test_settings, "up", "head")
 
 
 async def jobs_columns(settings: Settings) -> set[str]:

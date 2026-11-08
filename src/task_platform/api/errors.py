@@ -6,7 +6,7 @@ only.
 """
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from enum import StrEnum
 from http import HTTPStatus
 from types import MappingProxyType
@@ -19,6 +19,7 @@ from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.exceptions import HTTPException
 from starlette.requests import ClientDisconnect
+from starlette.routing import BaseRoute, Match
 
 from task_platform import safe_logging
 from task_platform.api.schemas import ErrorBody, ErrorResponse
@@ -121,8 +122,8 @@ async def _handle_domain_error(request: Request, exc: Exception) -> JSONResponse
 
 async def _handle_request_validation_error(request: Request, exc: Exception) -> JSONResponse:
     # Replaces FastAPI's default 422, which returns each error's input, msg and ctx: all three can
-    # quote the client's value. Raised today only for path parameters (POST /jobs reads its body
-    # itself), e.g. "path.job_id: uuid_parsing".
+    # quote the client's value. Raised for path and query parameters (POST /jobs reads its body
+    # itself), e.g. "path.job_id: uuid_parsing" or "query.limit: less_than_equal".
     error = cast(RequestValidationError, exc)
     return error_response(
         status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -132,17 +133,40 @@ async def _handle_request_validation_error(request: Request, exc: Exception) -> 
     )
 
 
-async def _handle_http_exception(request: Request, exc: Exception) -> JSONResponse:
-    error = cast(HTTPException, exc)
-    fallback = (
-        ApiErrorCode.INTERNAL_ERROR if error.status_code >= 500 else ApiErrorCode.INVALID_REQUEST
-    )
-    code = _HTTP_EXCEPTION_CODES.get(error.status_code, fallback)
-    # The standard phrase, not exc.detail: a detail passed by other code could hold input. The
-    # headers are kept, e.g. Allow on a 405.
-    return error_response(
-        error.status_code, code, _status_phrase(error.status_code), headers=error.headers
-    )
+def _http_exception_handler(
+    routes: Sequence[BaseRoute],
+) -> Callable[[Request, Exception], Awaitable[JSONResponse]]:
+    async def handle(request: Request, exc: Exception) -> JSONResponse:
+        error = cast(HTTPException, exc)
+        fallback = (
+            ApiErrorCode.INTERNAL_ERROR
+            if error.status_code >= 500
+            else ApiErrorCode.INVALID_REQUEST
+        )
+        code = _HTTP_EXCEPTION_CODES.get(error.status_code, fallback)
+        headers = dict(error.headers or {})
+        if error.status_code == status.HTTP_405_METHOD_NOT_ALLOWED:
+            allowed = _allowed_methods(routes, request)
+            if allowed:
+                headers["Allow"] = ", ".join(allowed)
+        # The standard phrase, not exc.detail: a detail passed by other code could hold input.
+        # The other headers are kept.
+        return error_response(
+            error.status_code, code, _status_phrase(error.status_code), headers=headers
+        )
+
+    return handle
+
+
+def _allowed_methods(routes: Sequence[BaseRoute], request: Request) -> list[str]:
+    # Starlette's 405 names only the methods of the first route whose path matches: DELETE /jobs
+    # would answer "Allow: POST" although GET /jobs exists too. A route whose path matches but
+    # whose method does not is a partial match.
+    methods: set[str] = set()
+    for route in routes:
+        if route.matches(request.scope)[0] is Match.PARTIAL:
+            methods.update(getattr(route, "methods", None) or ())
+    return sorted(methods)
 
 
 def _status_phrase(status_code: int) -> str:
@@ -231,13 +255,15 @@ async def _handle_unexpected_error(request: Request, exc: Exception) -> JSONResp
     )
 
 
-def register_error_handlers(app: FastAPI) -> None:
+def register_error_handlers(app: FastAPI, routes: Sequence[BaseRoute]) -> None:
+    """`routes` are the API's own routes, as their routers hold them (included without a prefix).
+    FastAPI's app.routes does not list them one by one, so the 405 handler is given them here."""
     app.add_exception_handler(ApiError, _handle_api_error)
     app.add_exception_handler(DomainError, _handle_domain_error)
     app.add_exception_handler(RequestValidationError, _handle_request_validation_error)
     # Replaces FastAPI's default, which answers {"detail": ...}. FastAPI's HTTPException is a
     # subclass, so it is covered too.
-    app.add_exception_handler(HTTPException, _handle_http_exception)
+    app.add_exception_handler(HTTPException, _http_exception_handler(routes))
     app.add_exception_handler(SQLAlchemyError, _handle_database_error)
     app.add_exception_handler(OSError, _handle_connection_error)
     app.add_exception_handler(ClientDisconnect, _handle_client_disconnect)

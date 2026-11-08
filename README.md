@@ -4,13 +4,14 @@ A background-job system built to make failure behaviour explicit: an HTTP API sa
 PostgreSQL, a dispatcher publishes them to RabbitMQ, and separate workers run them with bounded
 retries, so slow work stays out of the request path and every failure is recorded.
 
-> **Status: early development (phase 5 of 10).** So far there are the domain rules, a local
+> **Status: early development (phase 6 of 10).** So far there are the domain rules, a local
 > PostgreSQL with migrations for the `jobs` table (including the lease, error and result columns
 > the worker writes), the `job_attempts` table and the fake provider's `fake_notifications` table,
 > `POST /jobs` (validates and saves a job; 503 when the database is unavailable), `GET /jobs/{id}`
 > (a job's state, result or failure, never its payload), `GET /jobs/{id}/attempts` (each recorded
-> attempt and how it ended), the `/health` and `/ready` probes, a local RabbitMQ with the
-> connection, queue and confirmed-publish code, the dispatcher process that publishes saved jobs
+> attempt and how it ended), `GET /jobs?status=failed` (failed jobs, newest first), the `/health`
+> and `/ready` probes, a local RabbitMQ with the connection, queue, dead-letter queue and
+> confirmed-publish code, the dispatcher process that publishes saved jobs
 > to it, the worker process that claims each job, runs it against a fake notification provider,
 > records the result and retries the handler's own failures with backoff, and the development
 > checks (see Development setup). Architecture says which parts of the design run today; MVP
@@ -37,13 +38,14 @@ The diagram and the bullets describe the design; the last bullet says what runs 
   message cannot claim a job that is already claimed. Each claim holds a lease; jobs of crashed
   workers are recovered when the lease expires, and a stale worker's late result is rejected
   ([ADR 0001](docs/adr/0001-job-lifecycle.md)).
-- **Running today (phase 5):** the API, the dispatcher and the worker run as separate processes
+- **Running today (phase 6):** the API, the dispatcher and the worker run as separate processes
   (`make run`, `make dispatcher`, `make worker`), with the claim, the lease column, the fenced
-  final update, retries with exponential backoff and jitter, and a row per attempt. Integration
-  tests take a job from `POST /jobs` through the dispatcher and a worker to `succeeded`, once at
-  the first attempt and once after two failed attempts, and a job that always fails to `failed`
-  after its last attempt. **Not yet:** recovery of expired leases and lost messages (phase 8) and
-  dead letters (phase 6).
+  final update, retries with exponential backoff and jitter, a row per attempt, a dead-letter
+  queue for messages the worker can never process, and a list of failed jobs. Integration tests
+  take a job from `POST /jobs` through the dispatcher and a worker to `succeeded`, once at the
+  first attempt and once after two failed attempts, and a job that always fails to `failed` after
+  its last attempt, where the failed-jobs list shows it. **Not yet:** recovery of expired leases
+  and lost messages (phase 8).
 
 ## MVP scope
 
@@ -76,7 +78,7 @@ The ADRs refer to these phases by number.
 3. Dispatcher, RabbitMQ and the first worker *(done)*
 4. Status and result endpoints *(done)*
 5. Retries with exponential backoff and jitter *(done)*
-6. Dead letters and failure inspection
+6. Dead letters and failure inspection *(done)*
 7. Idempotency for submission and side effects
 8. Graceful shutdown, stale-job and lost-message recovery, broker outages
 9. Failure-path test suite
@@ -91,6 +93,7 @@ The ADRs refer to these phases by number.
 | [0003](docs/adr/0003-async-io-stack.md) | asyncio throughout: SQLAlchemy asyncio, asyncpg, aio-pika |
 | [0004](docs/adr/0004-dispatch-and-consumption.md) | One quorum queue; the worker acks, nacks or rejects per outcome |
 | [0005](docs/adr/0005-retries-and-attempt-records.md) | Only handler failures are retried, with full-jitter backoff; a row per attempt |
+| [0006](docs/adr/0006-dead-letters.md) | Messages the worker can never process go to a dead-letter queue; failed jobs stay rows |
 
 ## Reading a job
 
@@ -135,6 +138,53 @@ that no longer passes validation fails the job at once: it would fail the same w
 job is first claimed, and for a job that ran before migration 0003; an unknown job gets `404
 job_not_found`. The list need not start at attempt 1: see Known limitations.
 
+## Listing failed jobs
+
+`GET /jobs?status=failed` lists failed jobs, newest first, each exactly as `GET /jobs/{id}` shows
+it, never with its payload. `status` is required and only `failed` is accepted so far.
+
+```json
+{"jobs": [{"id": "…", "status": "failed", "attempts": 3, "max_attempts": 3, "…": "…",
+           "failure": {"code": "handler_error", "message": "the job's handler raised an error"}}],
+ "next_cursor": "MjAyNi0xMS0wN1QyMzo1OTowMS4xMjM0NTYrMDA6MDBf…"}
+```
+
+A page holds `limit` jobs (1–100, default 50; placeholders, not measured). Pass `next_cursor` back
+as `cursor` for the next page; it is `null` on the last one. The cursor is opaque. Pages are cut by
+the time a job failed and then its ID, and a failed job never changes again, so walking the pages
+lists every failed job that existed when the walk began exactly once, even while new jobs fail. A
+cursor the API did not make gets `422 invalid_request`. Migration 0004 adds the index the list
+reads.
+
+## Dead letters
+
+A job that failed for good is its `failed` row in PostgreSQL, readable over the API. A **message**
+the worker can never process is kept on RabbitMQ instead of being dropped
+([ADR 0006](docs/adr/0006-dead-letters.md)). It goes to the dead-letter queue
+`<JOBS_QUEUE_NAME>.dead` (`jobs.dead` by default) when:
+
+- it cannot be parsed (the worker rejects it), with reason `rejected`;
+- it is returned to the queue more than 20 times (`x-delivery-limit`): requeued with `reject` after
+  a bug in its handling, or left unacknowledged when its worker dies, with reason `delivery_limit`.
+
+A database outage never sends a message there: the worker answers it with `nack`, which RabbitMQ
+does not count. Nothing reads the dead-letter queue and it never changes a job: a job whose message
+died stays `queued` or `running` until recovery (phase 8). To see how many messages it holds:
+
+```bash
+docker compose exec rabbitmq rabbitmqctl list_queues name messages
+```
+
+A message's body is `{"message_version": 1, "job_id": "…"}`, which names its job, and its
+`x-death` header says from which queue and why. The project has no tool to show a body yet.
+
+**Upgrading from phase 5.** The jobs queue's arguments are fixed when RabbitMQ creates it, so a
+`jobs` queue created by an earlier version makes the dispatcher and the worker stop at start with
+`PRECONDITION_FAILED`. Recreate it once: stop the dispatcher; let the workers empty the queue, then
+stop them (a running worker would declare a deleted queue again, with the old arguments); run
+`docker compose exec rabbitmq rabbitmqctl delete_queue jobs --if-empty --if-unused`; start the new
+version.
+
 ## Health and readiness probes
 
 - `GET /health` is liveness: it returns `200 {"status": "ok"}` whenever the process answers and
@@ -154,9 +204,10 @@ job_not_found`. The list need not start at attempt 1: see Known limitations.
 ## Known limitations
 
 - **No authentication.** Anyone who can reach the API can submit jobs, which means triggering
-  notifications, and anyone who knows a job ID can read that job's status. Run it only on a trusted
-  network. The same goes for `/ready`: it tells anyone who can reach it whether the database is
-  at this code's migration revision.
+  notifications, and anyone who knows a job ID can read that job's status. `GET /jobs?status=failed`
+  also lets anyone find the IDs, codes and times of failed jobs without knowing an ID first (never
+  their payloads). Run it only on a trusted network. The same goes for `/ready`: it tells anyone
+  who can reach it whether the database is at this code's migration revision.
 - A worker crash uses up one of the job's attempts, even when the crash had nothing to do with the
   job (ADR 0001).
 - Dispatch latency is up to one dispatcher poll interval plus one poll (ADR 0002) while fewer than
@@ -189,8 +240,15 @@ job_not_found`. The list need not start at attempt 1: see Known limitations.
 - When the final update fails with a database error, the message is requeued, but its redelivery
   loses the claim: the job stays `running` until stale-job recovery (phase 8).
 - An unexpected error while handling a message (a bug) requeues it with `reject`, which counts:
-  after RabbitMQ's delivery limit (20) the message is dropped, and a job that was never claimed
-  stays `queued`, already dispatched, until lost-message recovery (phase 8).
+  past RabbitMQ's delivery limit (20) the message goes to the dead-letter queue, and a job that was
+  never claimed stays `queued`, already dispatched, until lost-message recovery (phase 8).
+- Migration 0004 builds its index with a plain `CREATE INDEX` inside Alembic's transaction, which
+  blocks writes to `jobs` while it runs (`CONCURRENTLY` cannot run in a transaction). Fine for the
+  table sizes here, but not measured.
+- The dead-letter queue grows without limit: nothing consumes or expires it, and clearing it
+  (purging the queue) is an operator's decision. If it is deleted while the system runs, a message
+  that dies meanwhile waits for it and shows up in neither queue's `messages` count until it is
+  declared again; RabbitMQ then moves it, about 3 minutes later in the one test (ADR 0006).
 - The worker reconnects after a broker outage (an 87 s outage was observed once), but aio-pika can
   still end its consumer, after which the worker exits with an error and must be started again.
 - The dispatcher and the worker do not check the database's migration revision when they start.
@@ -264,12 +322,14 @@ make down                     # stop both; the data volumes are kept
   AMQP listener is up.
 - Integration tests fail, rather than skip, when `TEST_DATABASE_URL` or `TEST_BROKER_URL` is
   missing, and refuse any database whose name does not end in `_test`. Broker tests declare
-  queues with unique names and delete only those, so they can share the local RabbitMQ.
+  queues with unique names and delete only those and their `.dead` queues, so they can share the
+  local RabbitMQ.
 - The dispatcher stops at start if RabbitMQ is unreachable or the jobs queue cannot be declared; a
   database outage only fails polls, and the next poll tries again. It prints nothing while it
   works: until logging is configured (phase 8) only warnings reach stderr, such as a failed poll
   or a poll whose publishes were not confirmed (one line per poll, by error class).
-- The worker also stops at start if RabbitMQ is unreachable or the queue cannot be declared. While
+- The worker also stops at start if RabbitMQ is unreachable or the queue cannot be declared, for
+  example a `jobs` queue from before phase 6 (see Dead letters, "Upgrading from phase 5"). While
   the database is down it gives each message back (`nack`) after `WORKER_DB_ERROR_BACKOFF_S`, so
   no message is lost; its warnings name the job ID and error class, never the payload. Several
   workers can run at once: the claim lets only one of them run a job.

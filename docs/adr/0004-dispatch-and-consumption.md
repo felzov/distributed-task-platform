@@ -145,6 +145,29 @@ The rows of the table change as follows; every other row stays as it is:
   no open row to close, the worker logs it at ERROR and keeps the job's outcome: raising would roll
   the finish back and leave the job `running`.
 
+**Update 2026-11-07 (phase 6, dead letters):** ADR 0006 keeps the messages this ADR drops. What
+changes here; everything else still holds:
+
+- Decision 1: the jobs queue also gets `x-dead-letter-exchange: ""`, `x-dead-letter-routing-key:
+  {name}.dead`, `x-dead-letter-strategy: at-least-once`, `x-overflow: reject-publish` and an
+  explicit `x-delivery-limit: 20`. The limit is the same as before, but it is now set, so "no
+  delivery limit is set" no longer holds.
+- Decision 2: one function declares the dead-letter queue `{name}.dead` and then the jobs queue,
+  in both processes. A jobs queue created before phase 6 differs in its arguments, so both
+  processes stop at start with `PRECONDITION_FAILED` until it is recreated once (ADR 0006
+  decision 7).
+- Decision 7, and the unexpected-exception bullet of the 2026-11-02 update: a message that cannot
+  be parsed, and a message past the delivery limit, go to the dead-letter queue instead of being
+  dropped (tested through the worker). With the limit of 20, a message is dead-lettered when it
+  comes back from its 21st delivery. `nack` still never counts, also with dead-lettering set
+  (tested). The job of a dead-lettered message is not changed: it waits for phase 8 recovery, as
+  before.
+- Decision 9: a test also deletes its queue's `.dead` queue, and only that one.
+- The consequence "a message whose worker dies more than 20 times is dropped until phase 6": it is
+  now dead-lettered.
+- The alternative "a dedicated exchange now": settled by ADR 0006. The default exchange serves as
+  the dead-letter exchange, so there is still no exchange of our own.
+
 ## Consequences
 
 - A broker outage, a returned message and an unconfirmed publish all end the same way: the job

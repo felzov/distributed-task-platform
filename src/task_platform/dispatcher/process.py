@@ -51,7 +51,8 @@ async def poll_forever(
 async def open_dispatch_publisher(
     connection: AbstractConnection, settings: BrokerSettings
 ) -> JobPublisher:
-    """Declare the jobs queue, then open the publisher with the validated publish timeout."""
+    """Declare the jobs queue and its dead-letter queue, then open the publisher with the validated
+    publish timeout."""
     # Both processes declare the queue when they start (ADR 0004 decision 2). Not again later:
     # if the queue disappears while the dispatcher runs, publishes come back as returned and the
     # jobs stay due until a process declares it again.

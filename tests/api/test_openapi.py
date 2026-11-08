@@ -33,6 +33,7 @@ async def test_error_responses_use_the_envelope() -> None:
     envelope = {"$ref": "#/components/schemas/ErrorResponse"}
     expected = {
         ("/jobs", "post"): {"413", "422", "500", "503"},
+        ("/jobs", "get"): {"422", "500", "503"},
         ("/jobs/{job_id}", "get"): {"404", "422", "500", "503"},
         ("/jobs/{job_id}/attempts", "get"): {"404", "422", "500", "503"},
     }
@@ -125,3 +126,26 @@ async def test_attempts_response_documents_each_attempt() -> None:
         {"$ref": "#/components/schemas/FailureBody"},
         {"type": "null"},
     ]
+
+
+async def test_job_list_documents_its_query_and_page() -> None:
+    app = create_app(make_test_settings(UNREACHABLE_DATABASE_URL))
+    try:
+        spec = app.openapi()
+    finally:
+        await app.state.engine.dispose()
+
+    operation = spec["paths"]["/jobs"]["get"]
+    parameters = {p["name"]: p for p in operation["parameters"]}
+    assert set(parameters) == {"status", "limit", "cursor"}
+    assert parameters["status"]["required"] is True
+    # Only failed jobs can be listed so far.
+    assert parameters["status"]["schema"]["const"] == "failed"
+    limit = parameters["limit"]["schema"]
+    assert (limit["minimum"], limit["maximum"], limit["default"]) == (1, 100, 50)
+    ok = operation["responses"]["200"]["content"]["application/json"]
+    assert ok["schema"] == {"$ref": "#/components/schemas/JobListResponse"}
+    page = spec["components"]["schemas"]["JobListResponse"]
+    assert set(page["required"]) == {"jobs", "next_cursor"}
+    # Each job has the same shape as GET /jobs/{id}, so never a payload.
+    assert page["properties"]["jobs"]["items"] == {"$ref": "#/components/schemas/JobResponse"}

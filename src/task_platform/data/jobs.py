@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Row, func, insert, select, update
+from sqlalchemy import ColumnElement, Row, func, insert, literal, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.dml import ReturningUpdate
 
@@ -74,6 +74,52 @@ async def select_job(session: AsyncSession, job_id: uuid.UUID) -> JobStateRow | 
     return (await session.execute(statement)).one_or_none()
 
 
+def _has_status(status: JobStatus) -> ColumnElement[bool]:
+    """`status = '<value>'` written into the SQL, not bound: for queries a partial index serves.
+
+    asyncpg prepares every statement, and PostgreSQL may switch a prepared statement to a generic
+    plan after five runs. A generic plan cannot use a partial index whose condition depends on a
+    parameter (checked with EXPLAIN on PostgreSQL 18). The value is a fixed JobStatus member,
+    never input.
+    """
+    return Job.status == literal(status.value, literal_execute=True)
+
+
+async def select_failed_jobs(
+    session: AsyncSession, *, limit: int, before: tuple[datetime, uuid.UUID] | None = None
+) -> list[JobStateRow]:
+    """Failed jobs, newest first by (updated_at, id); only those before `before`, if given.
+
+    Keyset pagination: pass the last row's (updated_at, id) to get the next page. A failed job is
+    terminal, so its updated_at never changes and a page boundary cannot move (ADR 0001).
+    """
+    # The same columns as select_job, never `payload`. ix_jobs_failed (migration 0004) serves both
+    # the condition and the order.
+    statement = (
+        select(
+            Job.id,
+            Job.type,
+            Job.payload_version,
+            Job.status,
+            Job.attempts,
+            Job.max_attempts,
+            Job.available_at,
+            Job.created_at,
+            Job.updated_at,
+            Job.error_code,
+            Job.result,
+        )
+        .where(_has_status(JobStatus.FAILED))
+        .order_by(Job.updated_at.desc(), Job.id.desc())
+        .limit(limit)
+    )
+    if before is not None:
+        # A row comparison, so jobs that failed in the same microsecond are split by id, never
+        # skipped or repeated.
+        statement = statement.where(tuple_(Job.updated_at, Job.id) < tuple_(*before))
+    return list((await session.execute(statement)).all())
+
+
 async def select_due_job_ids(session: AsyncSession, *, limit: int) -> list[uuid.UUID]:
     """Lock and return up to `limit` jobs that are due for dispatch, oldest `available_at` first.
 
@@ -85,7 +131,8 @@ async def select_due_job_ids(session: AsyncSession, *, limit: int) -> list[uuid.
     statement = (
         select(Job.id)
         .where(
-            Job.status == JobStatus.QUEUED,
+            # Inline, so a generic plan can still use ix_jobs_dispatch_due (see _has_status).
+            _has_status(JobStatus.QUEUED),
             Job.dispatched_at.is_(None),
             Job.available_at <= func.now(),
         )
