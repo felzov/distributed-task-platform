@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Row, func, insert, select, update
+from sqlalchemy import ColumnElement, Row, func, insert, literal, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.dml import ReturningUpdate
 
@@ -74,6 +74,17 @@ async def select_job(session: AsyncSession, job_id: uuid.UUID) -> JobStateRow | 
     return (await session.execute(statement)).one_or_none()
 
 
+def _has_status(status: JobStatus) -> ColumnElement[bool]:
+    """`status = '<value>'` written into the SQL, not bound: for queries a partial index serves.
+
+    asyncpg prepares every statement, and PostgreSQL may switch a prepared statement to a generic
+    plan after five runs. A generic plan cannot use a partial index whose condition depends on a
+    parameter (checked with EXPLAIN on PostgreSQL 18). The value is a fixed JobStatus member,
+    never input.
+    """
+    return Job.status == literal(status.value, literal_execute=True)
+
+
 async def select_due_job_ids(session: AsyncSession, *, limit: int) -> list[uuid.UUID]:
     """Lock and return up to `limit` jobs that are due for dispatch, oldest `available_at` first.
 
@@ -85,7 +96,8 @@ async def select_due_job_ids(session: AsyncSession, *, limit: int) -> list[uuid.
     statement = (
         select(Job.id)
         .where(
-            Job.status == JobStatus.QUEUED,
+            # Inline, so a generic plan can still use ix_jobs_dispatch_due (see _has_status).
+            _has_status(JobStatus.QUEUED),
             Job.dispatched_at.is_(None),
             Job.available_at <= func.now(),
         )
