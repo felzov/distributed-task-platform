@@ -121,8 +121,8 @@ async def _handle_domain_error(request: Request, exc: Exception) -> JSONResponse
 
 async def _handle_request_validation_error(request: Request, exc: Exception) -> JSONResponse:
     # Replaces FastAPI's default 422, which returns each error's input, msg and ctx: all three can
-    # quote the client's value. Raised today only for path parameters (POST /jobs reads its body
-    # itself), e.g. "path.job_id: uuid_parsing".
+    # quote the client's value. Raised for path and query parameters (POST /jobs reads its body
+    # itself), e.g. "path.job_id: uuid_parsing" or "query.limit: less_than_equal".
     error = cast(RequestValidationError, exc)
     return error_response(
         status.HTTP_422_UNPROCESSABLE_CONTENT,

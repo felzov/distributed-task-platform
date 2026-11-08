@@ -57,6 +57,14 @@ class JobResponse(BaseModel):
     failure: FailureBody | None
 
 
+class JobListResponse(BaseModel):
+    """Body of `GET /jobs?status=failed`: one page, newest first."""
+
+    jobs: list[JobResponse]
+    # Pass it as `cursor` for the next page; null on the last page.
+    next_cursor: str | None
+
+
 class AttemptBody(BaseModel):
     """One attempt of a job. `outcome` is null while it runs, and after its worker crashed."""
 

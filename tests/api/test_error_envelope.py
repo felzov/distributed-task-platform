@@ -1,6 +1,7 @@
 """HTTP errors from routing (unknown path, wrong method) or any HTTPException use the envelope."""
 
 import logging
+import uuid
 
 import httpx
 import pytest
@@ -28,13 +29,14 @@ async def test_unknown_path_returns_the_envelope() -> None:
 
 
 async def test_wrong_method_returns_the_envelope_and_keeps_allow() -> None:
-    response = await request("GET", "/jobs")
+    # A path with one route: for /jobs, Starlette names only the first matching route's methods.
+    response = await request("DELETE", f"/jobs/{uuid.uuid4()}")
     assert response.status_code == 405
     assert response.json() == {
         "error": {"code": "method_not_allowed", "message": "method not allowed", "details": []}
     }
     # RFC 9110 requires Allow on a 405; the handler must keep the exception's headers.
-    assert response.headers["allow"] == "POST"
+    assert response.headers["allow"] == "GET"
 
 
 @pytest.mark.parametrize(

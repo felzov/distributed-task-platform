@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from task_platform.config import Settings
 from task_platform.data.attempts import AttemptRow, select_attempts
-from task_platform.data.jobs import insert_job, select_job
+from task_platform.data.jobs import JobStateRow, insert_job, select_failed_jobs, select_job
 from task_platform.domain.attempts import AttemptOutcome
 from task_platform.domain.errors import JobNotFoundError
 from task_platform.domain.failures import FAILURE_MESSAGES, UNKNOWN_FAILURE_MESSAGE, FailureCode
@@ -100,6 +100,35 @@ async def get_job(session_factory: async_sessionmaker[AsyncSession], job_id: uui
         row = await select_job(session, job_id)
     if row is None:
         raise JobNotFoundError()
+    return _job_state(row)
+
+
+@dataclass(frozen=True)
+class FailedJobsPage:
+    jobs: list[JobState]
+    # The last job's (updated_at, id) if more failed jobs follow, else None.
+    next_after: tuple[datetime, uuid.UUID] | None
+
+
+async def list_failed_jobs(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    limit: int,
+    after: tuple[datetime, uuid.UUID] | None = None,
+) -> FailedJobsPage:
+    """One page of failed jobs, newest first; `after` is the previous page's `next_after`."""
+    async with session_factory() as session:
+        # One row more than the page, to know whether another page follows without a second query.
+        rows = await select_failed_jobs(session, limit=limit + 1, before=after)
+    shown = rows[:limit]
+    more = len(rows) > limit
+    return FailedJobsPage(
+        jobs=[_job_state(row) for row in shown],
+        next_after=(shown[-1].updated_at, shown[-1].id) if more else None,
+    )
+
+
+def _job_state(row: JobStateRow) -> JobState:
     status = JobStatus(row.status)
     return JobState(
         id=row.id,
@@ -111,8 +140,8 @@ async def get_job(session_factory: async_sessionmaker[AsyncSession], job_id: uui
         available_at=row.available_at,
         created_at=row.created_at,
         updated_at=row.updated_at,
-        result=_result(job_id, row.result) if status is JobStatus.SUCCEEDED else None,
-        failure=_failure(job_id, row.error_code) if status is JobStatus.FAILED else None,
+        result=_result(row.id, row.result) if status is JobStatus.SUCCEEDED else None,
+        failure=_failure(row.id, row.error_code) if status is JobStatus.FAILED else None,
     )
 
 
