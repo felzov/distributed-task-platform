@@ -7,7 +7,8 @@ retries, so slow work stays out of the request path and every failure is recorde
 > **Status: early development (phase 6 of 10).** So far there are the domain rules, a local
 > PostgreSQL with migrations for the `jobs` table (including the lease, error and result columns
 > the worker writes), the `job_attempts` table and the fake provider's `fake_notifications` table,
-> `POST /jobs` (validates and saves a job; 503 when the database is unavailable), `GET /jobs/{id}`
+> `POST /jobs` (validates and saves a job, safe to retry with an `Idempotency-Key`; 503 when the
+> database is unavailable), `GET /jobs/{id}`
 > (a job's state, result or failure, never its payload), `GET /jobs/{id}/attempts` (each recorded
 > attempt and how it ended), `GET /jobs?status=failed` (failed jobs, newest first), the `/health`
 > and `/ready` probes, a local RabbitMQ with the connection, queue, dead-letter queue and
@@ -94,6 +95,43 @@ The ADRs refer to these phases by number.
 | [0004](docs/adr/0004-dispatch-and-consumption.md) | One quorum queue; the worker acks, nacks or rejects per outcome |
 | [0005](docs/adr/0005-retries-and-attempt-records.md) | Only handler failures are retried, with full-jitter backoff; a row per attempt |
 | [0006](docs/adr/0006-dead-letters.md) | Messages the worker can never process go to a dead-letter queue; failed jobs stay rows |
+
+## Submitting a job
+
+`POST /jobs` takes `{"type", "payload_version", "payload"}` and answers `202 {"id", "status"}`
+with a `Location` header once the job is saved (not yet dispatched).
+
+To retry a submission safely, send an `Idempotency-Key` header and retry with the same key and the
+same body (ADR 0007):
+
+```http
+POST /jobs
+Idempotency-Key: 8e03978e-40d5-43e8-bc93-6894a57f9324
+Content-Type: application/json
+
+{"type": "notification.send", "payload_version": 1,
+ "payload": {"recipient": "max@example.com", "subject": "Hi", "body": "Hello"}}
+```
+
+| The key | Answer |
+|---------|--------|
+| Not sent, or not used before | `202` and a new job, as above |
+| Used before, with the same `type`, `payload_version` and `payload` | `200` with that job's ID and *current* status, and its `Location`; nothing new is saved |
+| Used before, with anything else | `422 idempotency_key_reused`; nothing is saved |
+
+- A key is 1–255 visible ASCII characters (no spaces), compared exactly; `"abc"` with quotes and
+  `abc` are different keys. Anything else, or the header sent twice, is `422 invalid_request`.
+- Use a random value such as a UUIDv4, a new one per job. A key must not carry secrets: it is
+  stored as sent (never returned or logged).
+- **Keys never expire.** A key names its job for as long as the job exists, and jobs are never
+  deleted.
+- "The same body" means the same parsed JSON: whitespace and the order of object keys do not
+  matter; any other difference counts.
+- The key is checked before the body, and the body before the database, so a refused request does
+  not use its key: fix the body and send it again with the same key.
+- Two requests with one key at the same time do not both save a job: the second waits for the
+  first one's COMMIT, then gets the `200`. If that wait outlasts `DB_STATEMENT_TIMEOUT_MS`, it
+  gets `503`, and its next retry finds the job.
 
 ## Reading a job
 
@@ -269,9 +307,14 @@ version.
 - A worker whose lease expired may still finish its handler. Its result is rejected, but its side
   effect can happen twice, so handlers with side effects must be idempotent (ADR 0001).
 - Recovering a crashed worker's job takes up to the lease duration plus the recovery interval.
-- **A submission whose COMMIT outcome is unknown can be saved twice.** If the connection drops or
+- **A submission without an `Idempotency-Key` can be saved twice.** If the connection drops or
   `DB_COMMAND_TIMEOUT_S` expires while PostgreSQL commits, the client gets 503 although the job
-  may have been saved; a retry then creates a second job. Idempotency keys (phase 7) close this.
+  may have been saved, and the same happens to a client that never received its 202; a retry
+  without a key then creates a second job. A retry with the same key gets the saved job instead.
+- **Idempotency keys are global.** Without authentication there is one key space for everyone:
+  anyone who guesses a key and sends the same body gets that job's ID, a different body gets 422
+  (which shows the key is taken), and someone who learns a key before its owner uses it can take
+  it first. Random keys make guessing impractical.
 - Database and connection errors are logged as their class, SQLSTATE and constraint name only,
   without a traceback, because PostgreSQL's error detail can quote the stored payload. Any
   `OSError` is treated as "database unavailable" (503). Other unexpected errors return 500 and
