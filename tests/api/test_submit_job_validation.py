@@ -231,3 +231,74 @@ async def test_payload_over_limit_is_rejected_even_if_body_is_under_its_limit() 
     assert len(content) < LIMITS["max_request_body_bytes"]
     response = await post(content, **LIMITS)
     assert_error(response, 413, "payload_too_large")
+
+
+# Idempotency-Key (ADR 0007 decisions 2 and 7): checked first, from the headers alone
+
+KEY_DETAIL = "header.Idempotency-Key: invalid_idempotency_key"
+
+
+async def post_with_key(
+    key: str | bytes | list[str], content: bytes | None = None, **overrides: object
+) -> httpx.Response:
+    values = key if isinstance(key, list) else [key]
+    # As bytes, so a test can send any byte; Starlette decodes header values as Latin-1.
+    headers = [(b"content-type", b"application/json")] + [
+        (b"Idempotency-Key", v if isinstance(v, bytes) else v.encode("latin-1")) for v in values
+    ]
+    async with app_client(create_app(settings(**overrides))) as client:
+        return await client.post(
+            "/jobs", content=encode(envelope()) if content is None else content, headers=headers
+        )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("x" * 256, id="256 characters"),
+        pytest.param(f"{SENTINEL} two", id="inner space"),
+        pytest.param(f" {SENTINEL}", id="leading space"),
+        pytest.param(f"{SENTINEL}\tx", id="tab"),
+        pytest.param(f"{SENTINEL}\x7f", id="DEL"),
+        pytest.param(f"{SENTINEL}é".encode(), id="non-ASCII UTF-8"),
+        pytest.param(f"{SENTINEL}\xe9".encode("latin-1"), id="non-ASCII Latin-1"),
+    ],
+)
+async def test_an_invalid_key_is_rejected_without_echoing_it(key: str | bytes) -> None:
+    # The body is valid, so the key is what fails, and before the database: it is unreachable.
+    response = await post_with_key(key)
+    assert assert_error(response, 422, "invalid_request") == [KEY_DETAIL]
+
+
+async def test_a_repeated_key_header_is_rejected_even_with_equal_values() -> None:
+    # Which value would count is undefined (a proxy may join them with a comma), so neither does.
+    response = await post_with_key([SENTINEL, SENTINEL])
+    assert assert_error(response, 422, "invalid_request") == [
+        "header.Idempotency-Key: repeated_header"
+    ]
+
+
+async def test_the_key_is_checked_before_the_body() -> None:
+    # An oversized, malformed body would be a 413; the key's 422 shows it came first.
+    response = await post_with_key("", content=b"x" * 2_001, **LIMITS)
+    assert assert_error(response, 422, "invalid_request") == [KEY_DETAIL]
+
+
+async def test_a_valid_key_does_not_skip_the_body_checks() -> None:
+    response = await post_with_key("key-1", content=encode(envelope(payload_version=2)))
+    assert_error(response, 422, "unsupported_payload_version")
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param("a", id="1 character"),
+        pytest.param("x" * 255, id="255 characters"),
+        pytest.param('"8e03978e-40d5-43e8-bc93-6894a57f9324"', id="quoted UUID"),
+    ],
+)
+async def test_a_valid_key_with_a_valid_body_reaches_the_database(key: str) -> None:
+    # The database is unreachable, so getting that far shows as 503.
+    response = await post_with_key(key)
+    assert_error(response, 503, "service_unavailable")

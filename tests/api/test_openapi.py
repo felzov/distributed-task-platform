@@ -23,6 +23,26 @@ async def test_submit_request_body_schema_is_inline_and_complete() -> None:
     assert "$ref" not in json.dumps(schema)
 
 
+async def test_submit_documents_the_idempotency_key_and_its_200() -> None:
+    app = create_app(make_test_settings(UNREACHABLE_DATABASE_URL))
+    try:
+        spec = app.openapi()
+    finally:
+        await app.state.engine.dispose()
+
+    operation = spec["paths"]["/jobs"]["post"]
+    [parameter] = operation["parameters"]
+    assert (parameter["name"], parameter["in"], parameter["required"]) == (
+        "Idempotency-Key",
+        "header",
+        False,
+    )
+    assert (parameter["schema"]["minLength"], parameter["schema"]["maxLength"]) == (1, 255)
+    submitted = {"$ref": "#/components/schemas/SubmitJobResponse"}
+    for code in ("200", "202"):
+        assert operation["responses"][code]["content"]["application/json"]["schema"] == submitted
+
+
 async def test_error_responses_use_the_envelope() -> None:
     app = create_app(make_test_settings(UNREACHABLE_DATABASE_URL))
     try:

@@ -10,10 +10,17 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from task_platform.config import Settings
 from task_platform.data.attempts import AttemptRow, select_attempts
-from task_platform.data.jobs import JobStateRow, insert_job, select_failed_jobs, select_job
+from task_platform.data.jobs import (
+    JobStateRow,
+    insert_job,
+    insert_job_or_find_by_key,
+    select_failed_jobs,
+    select_job,
+)
 from task_platform.domain.attempts import AttemptOutcome
-from task_platform.domain.errors import JobNotFoundError
+from task_platform.domain.errors import IdempotencyKeyReusedError, JobNotFoundError
 from task_platform.domain.failures import FAILURE_MESSAGES, UNKNOWN_FAILURE_MESSAGE, FailureCode
+from task_platform.domain.idempotency import is_valid_idempotency_key, request_fingerprint
 from task_platform.domain.job_status import JobStatus
 from task_platform.domain.payloads import parse_payload
 
@@ -24,6 +31,8 @@ logger = logging.getLogger(__name__)
 class SubmittedJob:
     id: uuid.UUID
     status: JobStatus
+    # False when an idempotency key named a job saved earlier: nothing new was saved.
+    created: bool
 
 
 @dataclass(frozen=True)
@@ -73,24 +82,57 @@ async def submit_job(
     *,
     job_type: str,
     payload_version: int,
-    payload: object,
+    payload: dict[str, Any],
+    idempotency_key: str | None = None,
 ) -> SubmittedJob:
     """Validate a job and save it as `queued`. Returns only after the COMMIT has succeeded.
 
     Saved is not dispatched: the dispatcher publishes the job later (ADR 0002).
+
+    With `idempotency_key` (ADR 0007), a key not used before saves the job as above. A key used
+    before saves nothing: the same request gets that job, with its current status and
+    `created=False`; a different request raises IdempotencyKeyReusedError.
     """
+    if idempotency_key is not None and not is_valid_idempotency_key(idempotency_key):
+        # The API checks the key before it reads the body, so this is a bug in the caller. The
+        # database checks only the key's length, so an invalid key must not get that far.
+        raise ValueError("idempotency key is not valid")
     # Raises a DomainError before any database access.
     model = parse_payload(job_type, payload_version, payload, max_bytes=settings.max_payload_bytes)
     # The validated model is stored, never the raw input.
+    stored_payload = model.model_dump(mode="json")
+    if idempotency_key is None:
+        async with session_factory.begin() as session:
+            job_id, status = await insert_job(
+                session,
+                job_type=job_type,
+                payload_version=payload_version,
+                payload=stored_payload,
+                max_attempts=settings.default_max_attempts,
+            )
+        return SubmittedJob(id=job_id, status=JobStatus(status), created=True)
+
+    # Over the request as parsed, not the model's dump: a default field added to a payload model
+    # later must not turn an honest retry into a reuse (ADR 0007 decision 3).
+    fingerprint = request_fingerprint(job_type, payload_version, payload)
     async with session_factory.begin() as session:
-        job_id, status = await insert_job(
+        job = await insert_job_or_find_by_key(
             session,
             job_type=job_type,
             payload_version=payload_version,
-            payload=model.model_dump(mode="json"),
+            payload=stored_payload,
             max_attempts=settings.default_max_attempts,
+            idempotency_key=idempotency_key,
+            request_hash=fingerprint,
         )
-    return SubmittedJob(id=job_id, status=JobStatus(status))
+    if job.request_hash is None:
+        # ck_jobs_idempotency_key_has_hash forbids this, so it is a broken row, not a client's
+        # mistake: a 500, never a 422 that blames the client. Logged by job ID, never by key.
+        logger.error("job %s has an idempotency key but no request hash", job.id)
+        raise RuntimeError("keyed job has no request hash")
+    if job.request_hash != fingerprint:
+        raise IdempotencyKeyReusedError()
+    return SubmittedJob(id=job.id, status=JobStatus(job.status), created=job.created)
 
 
 async def get_job(session_factory: async_sessionmaker[AsyncSession], job_id: uuid.UUID) -> JobState:
