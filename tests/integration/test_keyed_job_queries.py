@@ -158,6 +158,47 @@ async def test_an_insert_waits_for_an_uncommitted_insert_of_its_key(engine: Asyn
     assert len(await job_rows(engine)) == 1
 
 
+class FirstRequestError(Exception):
+    pass
+
+
+async def test_an_insert_saves_the_job_if_the_first_insert_of_its_key_rolls_back(
+    engine: AsyncEngine,
+) -> None:
+    # ADR 0007 decision 5, the other branch: the transaction holding the key rolls back (its
+    # request timed out, its client went away), so the waiting INSERT goes ahead and saves its own
+    # job. A SELECT-then-INSERT would find nothing here and fail.
+    sessions = async_sessionmaker(engine)
+    second_task: asyncio.Task[KeyedJob] | None = None
+    try:
+        with pytest.raises(FirstRequestError):
+            async with sessions.begin() as first_session:
+                assert (await insert_keyed(first_session)).created
+                first_pid = await first_session.scalar(text("SELECT pg_backend_pid()"))
+
+                second_task = asyncio.create_task(
+                    insert_keyed_once(engine, request_hash=OTHER_HASH)
+                )
+                await wait_until_blocked_by(engine, first_pid)
+                assert not second_task.done()
+                # Leaving the block with an exception rolls the first transaction back.
+                raise FirstRequestError
+
+        # Set inside the block above, which mypy cannot follow through pytest.raises.
+        assert second_task is not None
+        second = await asyncio.wait_for(second_task, timeout=5)
+    finally:
+        if second_task is not None and not second_task.done():
+            second_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await second_task
+
+    assert second.created
+    assert second.request_hash == OTHER_HASH
+    rows = await job_rows(engine)
+    assert [(row["id"], row["request_hash"]) for row in rows] == [(second.id, OTHER_HASH)]
+
+
 async def wait_until_blocked_by(engine: AsyncEngine, pid: int) -> None:
     """Return once a backend waits for a lock held by backend `pid`; fail after 5 s."""
     async with asyncio.timeout(5), engine.connect() as connection:
