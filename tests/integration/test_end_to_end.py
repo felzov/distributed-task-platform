@@ -314,6 +314,54 @@ async def test_a_job_that_fails_twice_is_retried_and_succeeds_on_attempt_3(
     assert ERROR_SENTINEL not in await stored_text(engine, job_id)
 
 
+def sending_then_failing_handlers(succeeds_on: int) -> Mapping[str, Handler]:
+    """The real handler on every attempt, but attempts before `succeeds_on` fail after it."""
+
+    async def handler(
+        session_factory: async_sessionmaker[AsyncSession], job: ClaimedJob, payload: PayloadModel
+    ) -> dict[str, Any]:
+        result = await send_notification(session_factory, job, payload)
+        if job.attempt < succeeds_on:
+            raise RuntimeError(ERROR_SENTINEL)
+        return result
+
+    return {NOTIFICATION_SEND: handler}
+
+
+async def test_a_job_whose_attempts_all_reach_the_provider_sends_one_notification(
+    engine: AsyncEngine,
+    broker_connection: AbstractRobustConnection,
+    retry_settings: BrokerSettings,
+    test_database_url: str,
+    answers: list[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The repeat ADR 0007 exists for: each attempt calls the provider and then fails (as when the
+    # provider answered but the worker's next step did not), so three attempts call it three times.
+    caplog.set_level(logging.INFO)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    publisher = await open_dispatch_publisher(broker_connection, retry_settings)
+
+    async with app_client(
+        create_app(make_test_settings(test_database_url, default_max_attempts=3))
+    ) as client:
+        job_id = (await client.post("/jobs", json=JOB)).json()["id"]
+        async with running(
+            broker_connection, publisher, sessions, retry_settings, sending_then_failing_handlers(3)
+        ):
+            status = await wait_until(client, job_id, "succeeded")
+            await wait_for_answers(answers, 3)
+
+    assert answers == ["ack", "ack", "ack"]
+    assert status["attempts"] == 3
+    # One notification, from attempt 1, and the job's result names it.
+    [notification] = await fake_notification_rows(engine, job_id)
+    assert notification["attempt"] == 1
+    assert (status["result"], status["failure"]) == (fake_result(notification), None)
+    assert warnings(caplog) == handler_failures(job_id, range(1, 3))
+    assert SENTINEL not in caplog.text
+
+
 async def test_a_job_that_always_fails_stops_after_its_attempts(
     engine: AsyncEngine,
     broker_connection: AbstractRobustConnection,
