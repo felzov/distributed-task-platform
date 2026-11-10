@@ -4,7 +4,7 @@ A background-job system built to make failure behaviour explicit: an HTTP API sa
 PostgreSQL, a dispatcher publishes them to RabbitMQ, and separate workers run them with bounded
 retries, so slow work stays out of the request path and every failure is recorded.
 
-> **Status: early development (phase 6 of 10).** So far there are the domain rules, a local
+> **Status: early development (phase 7 of 10).** So far there are the domain rules, a local
 > PostgreSQL with migrations for the `jobs` table (including the lease, error and result columns
 > the worker writes), the `job_attempts` table and the fake provider's `fake_notifications` table,
 > `POST /jobs` (validates and saves a job, safe to retry with an `Idempotency-Key`; 503 when the
@@ -13,10 +13,11 @@ retries, so slow work stays out of the request path and every failure is recorde
 > attempt and how it ended), `GET /jobs?status=failed` (failed jobs, newest first), the `/health`
 > and `/ready` probes, a local RabbitMQ with the connection, queue, dead-letter queue and
 > confirmed-publish code, the dispatcher process that publishes saved jobs
-> to it, the worker process that claims each job, runs it against a fake notification provider,
-> records the result and retries the handler's own failures with backoff, and the development
-> checks (see Development setup). Architecture says which parts of the design run today; MVP
-> scope and the roadmap describe the planned design; Known limitations covers both.
+> to it, the worker process that claims each job, runs it against a fake notification provider
+> (one notification per job, however often its handler runs), records the result and retries the
+> handler's own failures with backoff, and the development checks (see Development setup).
+> Architecture says which parts of the design run today; MVP scope and the roadmap describe the
+> planned design; Known limitations covers both.
 
 ## Architecture
 
@@ -39,20 +40,22 @@ The diagram and the bullets describe the design; the last bullet says what runs 
   message cannot claim a job that is already claimed. Each claim holds a lease; jobs of crashed
   workers are recovered when the lease expires, and a stale worker's late result is rejected
   ([ADR 0001](docs/adr/0001-job-lifecycle.md)).
-- **Running today (phase 6):** the API, the dispatcher and the worker run as separate processes
+- **Running today (phase 7):** the API, the dispatcher and the worker run as separate processes
   (`make run`, `make dispatcher`, `make worker`), with the claim, the lease column, the fenced
   final update, retries with exponential backoff and jitter, a row per attempt, a dead-letter
-  queue for messages the worker can never process, and a list of failed jobs. Integration tests
+  queue for messages the worker can never process, a list of failed jobs, idempotency keys for
+  submissions, and one notification per job however often its handler runs. Integration tests
   take a job from `POST /jobs` through the dispatcher and a worker to `succeeded`, once at the
-  first attempt and once after two failed attempts, and a job that always fails to `failed` after
-  its last attempt, where the failed-jobs list shows it. **Not yet:** recovery of expired leases
+  first attempt, once after two failed attempts, and once after three attempts that each reached
+  the provider (one notification), and a job that always fails to `failed` after its last attempt,
+  where the failed-jobs list shows it. **Not yet:** recovery of expired leases
   and lost messages (phase 8).
 
 ## MVP scope
 
 - Submit a job of one type, `notification.send`, over HTTP. Its payload is typed, versioned and
   size-limited. The notification goes to a **fake provider** that records it in the database instead
-  of sending anything, so duplicate side effects are observable in tests.
+  of sending anything, so tests can see each notification and which attempt sent it.
 - Save the job durably and return its ID.
 - Dispatch it through RabbitMQ and run it in a separate worker process.
 - Retry failures with bounded attempts and exponential backoff with jitter.
@@ -80,7 +83,7 @@ The ADRs refer to these phases by number.
 4. Status and result endpoints *(done)*
 5. Retries with exponential backoff and jitter *(done)*
 6. Dead letters and failure inspection *(done)*
-7. Idempotency for submission and side effects
+7. Idempotency for submission and side effects *(done)*
 8. Graceful shutdown, stale-job and lost-message recovery, broker outages
 9. Failure-path test suite
 10. Documentation of delivery guarantees and operations
@@ -95,6 +98,7 @@ The ADRs refer to these phases by number.
 | [0004](docs/adr/0004-dispatch-and-consumption.md) | One quorum queue; the worker acks, nacks or rejects per outcome |
 | [0005](docs/adr/0005-retries-and-attempt-records.md) | Only handler failures are retried, with full-jitter backoff; a row per attempt |
 | [0006](docs/adr/0006-dead-letters.md) | Messages the worker can never process go to a dead-letter queue; failed jobs stay rows |
+| [0007](docs/adr/0007-idempotency.md) | Submissions deduplicated by an `Idempotency-Key` in PostgreSQL; side effects by the receiver, with a key per job |
 
 ## Submitting a job
 
@@ -119,8 +123,8 @@ Content-Type: application/json
 | Used before, with the same `type`, `payload_version` and `payload` | `200` with that job's ID and *current* status, and its `Location`; nothing new is saved |
 | Used before, with anything else | `422 idempotency_key_reused`; nothing is saved |
 
-- A key is 1–255 visible ASCII characters (no spaces), compared exactly; `"abc"` with quotes and
-  `abc` are different keys. Anything else, or the header sent twice, is `422 invalid_request`.
+- A key is 1–255 visible ASCII characters (no spaces), compared exactly; `"abc"` with quotes
+  and `abc` are different keys. Anything else, or the header sent twice, is `422 invalid_request`.
 - Use a random value such as a UUIDv4, a new one per job. A key must not carry secrets: it is
   stored as sent (never returned or logged).
 - **Keys never expire.** A key names its job for as long as the job exists, and jobs are never
@@ -131,7 +135,8 @@ Content-Type: application/json
   not use its key: fix the body and send it again with the same key.
 - Two requests with one key at the same time do not both save a job: the second waits for the
   first one's COMMIT, then gets the `200`. If that wait outlasts `DB_STATEMENT_TIMEOUT_MS`, it
-  gets `503`, and its next retry finds the job.
+  gets `503`, and its next retry finds the job. If the first request fails instead, the waiting
+  one saves its own job.
 
 ## Reading a job
 
@@ -141,7 +146,7 @@ timestamps, and two fields that depend on the status. It never returns the paylo
 | `status` | `result` | `failure` |
 |----------|----------|-----------|
 | `queued`, `running` | `null` | `null` |
-| `succeeded` | what the handler returned, e.g. `{"provider": "fake"}` | `null` |
+| `succeeded` | what the handler returned, e.g. `{"provider": "fake", "notification_id": "…"}` | `null` |
 | `failed` | `null` | `{"code": "handler_timeout", "message": "the job's handler did not finish in time"}` |
 
 `failure.code` is one of a fixed set of categories and `failure.message` a fixed sentence per code,
@@ -259,9 +264,15 @@ version.
 - Ctrl-C stops the dispatcher with a traceback, abandoning the poll in progress: its transaction
   rolls back and those jobs are published again later, so publishes the broker had already
   confirmed become duplicates. Graceful shutdown comes in phase 8.
-- A retry runs the handler again, side effects included: a handler that called the provider and
-  then timed out calls it again. The fake provider records one row per attempt that reached it.
-  Idempotent handlers come with phase 7.
+- A retry runs the handler again. For `notification.send` that is safe: the handler gives the
+  provider the key `notification.send:{job_id}`, and the fake provider records one notification
+  per key, so every attempt of a job, current or stale, gets the same `notification_id` (ADR 0007).
+  This relies on the receiver deduplicating by key; a real provider usually forgets keys after a
+  retention window, which must outlast a job's retries and any outage. Two different jobs with the
+  same content still send twice.
+- Notifications recorded before migration 0006 have no key: a job that had attempts before it and
+  after it can have more than one row. A job that succeeded before phase 7 keeps its old result,
+  `{"provider": "fake"}`, without a `notification_id`.
 - Full jitter has no minimum wait, so a retry can be published almost at once. There is no
   circuit breaker: while a provider is down, every job uses up all its attempts.
 - Attempt history starts with migration 0003. Jobs that ran before it have no attempt rows, and a
@@ -273,16 +284,18 @@ version.
   recovery (phase 8). Retrying would fail the same way on every delivery (ADR 0004).
 - Ctrl-C stops the worker with a traceback. The broker requeues the message it held. If the job
   was already claimed, the redelivery loses the claim, so the job stays `running` until stale-job
-  recovery (phase 8), and its notification may already have been recorded; otherwise the job is
-  claimed normally later.
+  recovery (phase 8), and its notification may already have been sent, once (a later attempt gets
+  the same one); otherwise the job is claimed normally later.
 - When the final update fails with a database error, the message is requeued, but its redelivery
   loses the claim: the job stays `running` until stale-job recovery (phase 8).
 - An unexpected error while handling a message (a bug) requeues it with `reject`, which counts:
   past RabbitMQ's delivery limit (20) the message goes to the dead-letter queue, and a job that was
   never claimed stays `queued`, already dispatched, until lost-message recovery (phase 8).
 - Migration 0004 builds its index with a plain `CREATE INDEX` inside Alembic's transaction, which
-  blocks writes to `jobs` while it runs (`CONCURRENTLY` cannot run in a transaction). Fine for the
-  table sizes here, but not measured.
+  blocks writes to `jobs` while it runs (`CONCURRENTLY` cannot run in a transaction). Migrations
+  0005 and 0006 add columns and unique constraints (0005 also CHECKs, which scan `jobs`), and
+  these block reads too, of `jobs` and `fake_notifications`, until they commit (PostgreSQL
+  documentation). Fine for the table sizes here, but not measured.
 - The dead-letter queue grows without limit: nothing consumes or expires it, and clearing it
   (purging the queue) is an operator's decision. If it is deleted while the system runs, a message
   that dies meanwhile waits for it and shows up in neither queue's `messages` count until it is
@@ -305,7 +318,8 @@ version.
 - `fake_notifications.job_id` has no index, so looking up a job's notifications (only tests do)
   scans the table. That is fine for the fake provider; a real provider's records would need one.
 - A worker whose lease expired may still finish its handler. Its result is rejected, but its side
-  effect can happen twice, so handlers with side effects must be idempotent (ADR 0001).
+  effect still happens; `notification.send` makes it the same notification as the current
+  attempt's. A future handler whose receiver takes no key needs a guard of its own (ADR 0007).
 - Recovering a crashed worker's job takes up to the lease duration plus the recovery interval.
 - **A submission without an `Idempotency-Key` can be saved twice.** If the connection drops or
   `DB_COMMAND_TIMEOUT_S` expires while PostgreSQL commits, the client gets 503 although the job
