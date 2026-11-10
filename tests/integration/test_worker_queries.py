@@ -1,4 +1,4 @@
-"""The worker's queries: claim, fenced finish or retry, the fake provider's record (ADR 0001)."""
+"""The worker's queries: claim, and the fenced finish or retry (ADR 0001)."""
 
 import asyncio
 import uuid
@@ -10,7 +10,6 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
-from task_platform.data.fake_notifications import insert_fake_notification
 from task_platform.data.jobs import (
     ClaimedJobRow,
     claim_job,
@@ -358,22 +357,3 @@ async def test_the_last_attempt_cannot_be_requeued(engine: AsyncEngine) -> None:
 
     assert not await retry(engine, job["id"], attempt=2)
     assert await job_row(engine, job["id"]) == running
-
-
-# The fake provider's record
-
-
-async def test_every_fake_notification_is_recorded(engine: AsyncEngine) -> None:
-    job = await insert_job(engine)
-    sessions = async_sessionmaker(engine)
-
-    # The same attempt calling the provider twice, as a crash before the final update can cause.
-    for _ in range(2):
-        async with sessions.begin() as session:
-            await insert_fake_notification(session, job_id=job["id"], attempt=1)
-
-    async with engine.connect() as connection:
-        rows = (
-            await connection.execute(text("SELECT job_id, attempt FROM fake_notifications"))
-        ).all()
-    assert [tuple(row) for row in rows] == [(job["id"], 1), (job["id"], 1)]

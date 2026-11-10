@@ -24,7 +24,7 @@ from task_platform.services.execution import Outcome, execute_job
 from task_platform.worker import process
 from task_platform.worker.handlers import HANDLERS
 from task_platform.worker.process import Delivery, consume_forever, open_jobs_queue, run_worker
-from tests.integration.rows import insert_job
+from tests.integration.rows import fake_notification_rows, fake_result, insert_job
 from tests.settings import (
     UNREACHABLE_BROKER_URL,
     UNREACHABLE_DATABASE_URL,
@@ -193,8 +193,12 @@ async def test_a_delivered_job_succeeds_and_its_message_is_acked(
 
     assert answers == ["ack"]
     row = await job_row(engine, job_id)
-    assert (row["status"], row["attempts"], row["result"]) == ("succeeded", 1, {"provider": "fake"})
-    assert await notifications(engine, job_id) == 1
+    [notification] = await fake_notification_rows(engine, job_id)
+    assert (row["status"], row["attempts"], row["result"]) == (
+        "succeeded",
+        1,
+        fake_result(notification),
+    )
     assert await ready_messages(broker_connection, settings.jobs_queue_name) == 0
     assert SENTINEL not in caplog.text
 

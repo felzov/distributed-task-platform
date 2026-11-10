@@ -25,6 +25,7 @@ from task_platform.services.notifications import send_notification
 from task_platform.worker.handlers import HANDLERS
 from task_platform.worker.process import consume_forever, open_jobs_queue
 from tests.app_client import app_client
+from tests.integration.rows import fake_notification_rows, fake_result
 from tests.settings import make_test_broker_settings, make_test_settings
 
 pytestmark = pytest.mark.integration
@@ -119,11 +120,12 @@ async def test_a_submitted_job_is_dispatched_run_once_and_reported_succeeded(
     assert "could not ack" not in caplog.text
     assert (status["attempts"], status["max_attempts"]) == (1, api_settings.default_max_attempts)
     # The client sees the handler's result through the API.
-    assert (status["result"], status["failure"]) == ({"provider": "fake"}, None)
     row = await job_row(engine, job_id)
     assert (row["error_code"], row["lease_expires_at"]) == (None, None)
-    # The fake provider was called exactly once.
-    assert await notification_attempts(engine, job_id) == [1]
+    # The fake provider was called exactly once, and its notification is the job's result.
+    [notification] = await fake_notification_rows(engine, job_id)
+    assert notification["attempt"] == 1
+    assert (status["result"], status["failure"]) == (fake_result(notification), None)
     # Acked: nothing left in the queue once the worker's connection is closed.
     async with broker_connection.channel() as channel:
         queue_state = await channel.declare_queue(settings.jobs_queue_name, passive=True)
@@ -280,7 +282,8 @@ async def test_a_job_that_fails_twice_is_retried_and_succeeds_on_attempt_3(
     assert answers == ["ack", "ack", "ack"]
     assert "could not ack" not in caplog.text
     assert (status["attempts"], status["max_attempts"]) == (3, 3)
-    assert (status["result"], status["failure"]) == ({"provider": "fake"}, None)
+    [notification] = await fake_notification_rows(engine, job_id)
+    assert (status["result"], status["failure"]) == (fake_result(notification), None)
     assert [(a["attempt"], a["outcome"]) for a in attempts] == [
         (1, "failed"),
         (2, "failed"),
