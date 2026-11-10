@@ -43,6 +43,8 @@ async def test_migrations_go_up_down_and_up_again(test_settings: Settings) -> No
         "job_attempts",
         "pk_job_attempts",
         "ix_jobs_failed",
+        "uq_jobs_idempotency_key",
+        "uq_fake_notifications_idempotency_key",
     }
 
     await migrate(test_settings, "up", "head")
@@ -239,6 +241,105 @@ async def test_existing_jobs_survive_0003_and_its_downgrade(
                 text("SELECT status FROM jobs WHERE id = :id"), {"id": job_id}
             )
         assert status == "succeeded"
+    finally:
+        # Shared test database: leave it at head, as the tests above do.
+        await migrate(test_settings, "up", "head")
+
+
+async def test_existing_jobs_survive_0005_and_its_downgrade(
+    engine: AsyncEngine, test_settings: Settings
+) -> None:
+    # ADR 0007 decision 4: no backfill. Jobs saved before 0005 have no key; the downgrade drops the
+    # keys and keeps the jobs.
+    new_columns = {"idempotency_key", "request_hash"}
+    try:
+        await migrate(test_settings, "down", "0004")
+        assert not new_columns & await jobs_columns(test_settings)
+        async with engine.begin() as connection:
+            old_job = await connection.scalar(
+                text(
+                    "INSERT INTO jobs (type, payload_version, payload, max_attempts)"
+                    " VALUES ('notification.send', 1, '{}', 5) RETURNING id"
+                )
+            )
+
+        await migrate(test_settings, "up", "0005")
+        async with engine.begin() as connection:
+            row = (
+                await connection.execute(
+                    text("SELECT idempotency_key, request_hash FROM jobs WHERE id = :id"),
+                    {"id": old_job},
+                )
+            ).one()
+            assert tuple(row) == (None, None)
+            # A keyed job, so the downgrade has keys to drop.
+            keyed_job = await connection.scalar(
+                text(
+                    "INSERT INTO jobs (type, payload_version, payload, max_attempts,"
+                    " idempotency_key, request_hash) VALUES ('notification.send', 1, '{}', 5,"
+                    " 'key-1', :hash) RETURNING id"
+                ),
+                {"hash": bytes(32)},
+            )
+
+        await migrate(test_settings, "down", "0004")
+        assert not new_columns & await jobs_columns(test_settings)
+        assert "uq_jobs_idempotency_key" not in await schema_objects(test_settings)
+        async with engine.connect() as connection:
+            kept = await connection.scalar(
+                text("SELECT count(*) FROM jobs WHERE id IN (:old, :keyed)"),
+                {"old": old_job, "keyed": keyed_job},
+            )
+        assert kept == 2
+    finally:
+        # Shared test database: leave it at head, as the tests above do.
+        await migrate(test_settings, "up", "head")
+
+
+async def test_existing_notifications_survive_0006_and_its_downgrade(
+    engine: AsyncEngine, test_settings: Settings
+) -> None:
+    # ADR 0007 decision 8: no backfill. Notifications recorded before 0006 have no key, duplicates
+    # included; the downgrade drops the keys and keeps the rows.
+    try:
+        await migrate(test_settings, "down", "0005")
+        async with engine.begin() as connection:
+            job_id = await connection.scalar(
+                text(
+                    "INSERT INTO jobs (type, payload_version, payload, max_attempts)"
+                    " VALUES ('notification.send', 1, '{}', 5) RETURNING id"
+                )
+            )
+            for _ in range(2):
+                await connection.execute(
+                    text("INSERT INTO fake_notifications (job_id, attempt) VALUES (:id, 1)"),
+                    {"id": job_id},
+                )
+
+        await migrate(test_settings, "up", "0006")
+        async with engine.begin() as connection:
+            keys = await connection.scalars(
+                text("SELECT idempotency_key FROM fake_notifications WHERE job_id = :id"),
+                {"id": job_id},
+            )
+            assert list(keys) == [None, None]
+            # A keyed row, so the downgrade has a key to drop.
+            await connection.execute(
+                text(
+                    "INSERT INTO fake_notifications (job_id, attempt, idempotency_key)"
+                    " VALUES (:id, 2, 'key-1')"
+                ),
+                {"id": job_id},
+            )
+
+        await migrate(test_settings, "down", "0005")
+        assert "uq_fake_notifications_idempotency_key" not in await schema_objects(test_settings)
+        async with engine.connect() as connection:
+            kept = await connection.scalar(
+                text("SELECT count(*) FROM fake_notifications WHERE job_id = :id"),
+                {"id": job_id},
+            )
+        assert kept == 3
     finally:
         # Shared test database: leave it at head, as the tests above do.
         await migrate(test_settings, "up", "head")

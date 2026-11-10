@@ -11,6 +11,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from task_platform.data.db import create_db_engine
+from task_platform.domain.idempotency import MAX_IDEMPOTENCY_KEY_LENGTH
 from task_platform.domain.job_status import JobStatus
 from tests.integration.rows import insert_job
 from tests.settings import make_test_settings
@@ -19,6 +20,8 @@ pytestmark = pytest.mark.integration
 
 # Any instant will do: the CHECK asks only that a running job has a lease.
 LEASE = {"lease_expires_at": datetime(2026, 1, 1, tzinfo=UTC)}
+# Any 32 bytes will do: the CHECK asks only for a SHA-256's length (migration 0005).
+HASH = bytes(32)
 
 
 # Normal path
@@ -72,6 +75,9 @@ async def test_status_constraint_lists_exactly_the_domain_statuses(engine: Async
         {"status": "queued", "error_code": "handler_failed"},
         {"status": "failed", **LEASE},
         {"result": '{"sent": true}'},
+        {"idempotency_key": "k", "request_hash": HASH},
+        # The domain's limit, so a limit changed without a migration fails here (ADR 0007).
+        {"idempotency_key": "k" * MAX_IDEMPOTENCY_KEY_LENGTH, "request_hash": HASH},
     ],
 )
 async def test_boundary_values_are_accepted(engine: AsyncEngine, overrides: dict[str, Any]) -> None:
@@ -96,6 +102,15 @@ async def test_boundary_values_are_accepted(engine: AsyncEngine, overrides: dict
         ({"error_code": ""}, "ck_jobs_error_code_length"),
         ({"error_code": "x" * 101}, "ck_jobs_error_code_length"),
         ({"status": "running"}, "ck_jobs_running_has_lease"),
+        ({"idempotency_key": "k"}, "ck_jobs_idempotency_key_has_hash"),
+        ({"request_hash": HASH}, "ck_jobs_idempotency_key_has_hash"),
+        ({"idempotency_key": "", "request_hash": HASH}, "ck_jobs_idempotency_key_length"),
+        (
+            {"idempotency_key": "k" * (MAX_IDEMPOTENCY_KEY_LENGTH + 1), "request_hash": HASH},
+            "ck_jobs_idempotency_key_length",
+        ),
+        ({"idempotency_key": "k", "request_hash": bytes(31)}, "ck_jobs_request_hash_length"),
+        ({"idempotency_key": "k", "request_hash": bytes(33)}, "ck_jobs_request_hash_length"),
     ],
 )
 async def test_constraint_violations_are_rejected(
@@ -103,6 +118,27 @@ async def test_constraint_violations_are_rejected(
 ) -> None:
     with pytest.raises(IntegrityError, match=constraint):
         await insert_job(engine, **overrides)
+
+
+async def test_jobs_without_a_key_do_not_conflict(engine: AsyncEngine) -> None:
+    # NULLs are distinct in uq_jobs_idempotency_key (ADR 0007 decision 4).
+    for _ in range(3):
+        await insert_job(engine)
+    await insert_job(engine, idempotency_key="k", request_hash=HASH)
+    async with engine.connect() as connection:
+        assert await connection.scalar(text("SELECT count(*) FROM jobs")) == 4
+
+
+async def test_a_key_is_used_once(engine: AsyncEngine) -> None:
+    await insert_job(engine, idempotency_key="k", request_hash=HASH)
+    with pytest.raises(IntegrityError, match="uq_jobs_idempotency_key"):
+        await insert_job(engine, idempotency_key="k", request_hash=bytes(range(32)))
+
+
+async def test_keys_are_compared_byte_for_byte(engine: AsyncEngine) -> None:
+    # A quoted key (as the IETF draft writes one) and a differently cased key are other keys.
+    for key in ("k", '"k"', "K"):
+        await insert_job(engine, idempotency_key=key, request_hash=HASH)
 
 
 @pytest.mark.parametrize(

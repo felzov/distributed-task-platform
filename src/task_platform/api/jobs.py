@@ -1,5 +1,5 @@
-"""`POST /jobs` (size-capped body, envelope check, then the service), `GET /jobs?status=failed`,
-`GET /jobs/{id}` and `GET /jobs/{id}/attempts`."""
+"""`POST /jobs` (key format, size-capped body, envelope check, then the service),
+`GET /jobs?status=failed`, `GET /jobs/{id}` and `GET /jobs/{id}/attempts`."""
 
 import uuid
 from datetime import datetime
@@ -25,18 +25,64 @@ from task_platform.api.schemas import (
     SubmitJobRequest,
     SubmitJobResponse,
 )
+from task_platform.domain.idempotency import MAX_IDEMPOTENCY_KEY_LENGTH, is_valid_idempotency_key
 from task_platform.domain.payloads import safe_error_details
 from task_platform.services.jobs import get_attempts, get_job, list_failed_jobs, submit_job
 
 router = APIRouter()
 
-# The body is read by hand (to cap its size before parsing), so FastAPI cannot infer its schema.
-_REQUEST_BODY_DOC: Final[dict[str, Any]] = {
+IDEMPOTENCY_KEY_HEADER: Final = "Idempotency-Key"
+
+# The body and the Idempotency-Key header are read by hand (to cap the body's size before parsing,
+# and to see a repeated header), so FastAPI cannot infer either.
+_REQUEST_DOC: Final[dict[str, Any]] = {
     "requestBody": {
         "required": True,
         "content": {"application/json": {"schema": SubmitJobRequest.model_json_schema()}},
-    }
+    },
+    "parameters": [
+        {
+            "name": IDEMPOTENCY_KEY_HEADER,
+            "in": "header",
+            "required": False,
+            "description": (
+                "Makes a retry safe (ADR 0007): a key not used before saves the job (202); the"
+                " same key with the same type, version and payload returns that job (200); with"
+                " anything else, 422 idempotency_key_reused. Use a random value such as a UUIDv4;"
+                " keys never expire and must not carry secrets."
+            ),
+            "schema": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_IDEMPOTENCY_KEY_LENGTH,
+                "pattern": "^[\\x21-\\x7E]+$",
+            },
+        }
+    ],
 }
+
+
+def read_idempotency_key(request: Request) -> str | None:
+    """The request's Idempotency-Key, None without one, or a 422 if it is not a usable key.
+
+    Reads only the headers, so a bad key is refused before the body is read (ADR 0007 decision 7).
+    """
+    values = request.headers.getlist(IDEMPOTENCY_KEY_HEADER)
+    if not values:
+        return None
+    # The detail names only the header and the problem, never the value.
+    if len(values) > 1:
+        problem = "repeated_header"
+    elif not is_valid_idempotency_key(values[0]):
+        problem = "invalid_idempotency_key"
+    else:
+        return values[0]
+    raise ApiError(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        ApiErrorCode.INVALID_REQUEST,
+        "request is not valid",
+        (f"header.{IDEMPOTENCY_KEY_HEADER}: {problem}",),
+    )
 
 
 async def read_capped_body(request: Request, max_bytes: int) -> bytes:
@@ -87,11 +133,15 @@ def parse_envelope(body: bytes) -> SubmitJobRequest:
     "/jobs",
     status_code=status.HTTP_202_ACCEPTED,
     responses={
+        status.HTTP_200_OK: {
+            "model": SubmitJobResponse,
+            "description": "The Idempotency-Key names a job saved earlier: its current status",
+        },
         status.HTTP_413_CONTENT_TOO_LARGE: {"model": ErrorResponse},
         status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": ErrorResponse},
         **DATABASE_ERROR_RESPONSES,
     },
-    openapi_extra=_REQUEST_BODY_DOC,
+    openapi_extra=_REQUEST_DOC,
 )
 async def post_job(
     request: Request,
@@ -99,7 +149,12 @@ async def post_job(
     settings: AppSettings,
     session_factory: SessionFactory,
 ) -> SubmitJobResponse:
-    """Save a job. 202 means saved as `queued`, not dispatched (ADR 0002)."""
+    """Save a job. 202 means saved as `queued`, not dispatched (ADR 0002).
+
+    200 means nothing new was saved: the Idempotency-Key names an earlier job (ADR 0007).
+    """
+    # Cheapest check first: the key needs only the headers (ADR 0007 decision 7).
+    idempotency_key = read_idempotency_key(request)
     envelope = parse_envelope(await read_capped_body(request, settings.max_request_body_bytes))
     job = await submit_job(
         session_factory,
@@ -107,7 +162,10 @@ async def post_job(
         job_type=envelope.type,
         payload_version=envelope.payload_version,
         payload=envelope.payload,
+        idempotency_key=idempotency_key,
     )
+    if not job.created:
+        response.status_code = status.HTTP_200_OK
     response.headers["Location"] = f"/jobs/{job.id}"
     return SubmitJobResponse(id=job.id, status=job.status)
 

@@ -1,5 +1,6 @@
 """Rows written with raw SQL, bypassing the application code, to test the schema and queries."""
 
+import uuid
 from typing import Any
 
 from sqlalchemy import text
@@ -41,3 +42,23 @@ async def insert_attempt(engine: AsyncEngine, **overrides: Any) -> dict[str, Any
             text(f"INSERT INTO job_attempts ({columns}) VALUES ({params}) RETURNING *"), values
         )
         return dict(result.mappings().one())
+
+
+async def fake_notification_rows(
+    engine: AsyncEngine, job_id: uuid.UUID | str
+) -> list[dict[str, Any]]:
+    """The fake provider's rows for one job, oldest first."""
+    async with engine.connect() as connection:
+        result = await connection.execute(
+            text(
+                "SELECT id, attempt, idempotency_key FROM fake_notifications WHERE job_id = :id"
+                " ORDER BY created_at, attempt"
+            ),
+            {"id": job_id},
+        )
+        return [dict(row) for row in result.mappings()]
+
+
+def fake_result(notification: dict[str, Any]) -> dict[str, Any]:
+    """The result `notification.send` stores for the job of this fake_notifications row."""
+    return {"provider": "fake", "notification_id": str(notification["id"])}

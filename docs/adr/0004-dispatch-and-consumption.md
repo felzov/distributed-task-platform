@@ -1,6 +1,6 @@
 # ADR 0004 — Dispatch and consumption over RabbitMQ
 
-- **Status:** Accepted (updated 2026-11-07)
+- **Status:** Accepted (updated 2026-11-07, 2026-11-10)
 - **Date:** 2026-10-29
 
 ## Context
@@ -167,6 +167,14 @@ changes here; everything else still holds:
   now dead-lettered.
 - The alternative "a dedicated exchange now": settled by ADR 0006. The default exchange serves as
   the dead-letter exchange, so there is still no exchange of our own.
+
+**Update 2026-11-10 (phase 7, idempotency):** the fake-provider bullet of the 2026-11-02 update no
+longer holds as written. Migration 0006 adds `fake_notifications.idempotency_key` (unique), and
+the provider records one row per key: a later call with the key returns the first row's ID and
+records nothing (ADR 0007 decision 8). The handler's key is `notification.send:{job_id}`, and its
+result names the notification. A repeat is now counted differently: one row in `job_attempts` per
+attempt, one row in `fake_notifications` per job, and the job's result naming that row's ID. Rows
+recorded before migration 0006 have no key and keep their duplicates.
 
 ## Consequences
 

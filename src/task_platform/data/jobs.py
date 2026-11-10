@@ -1,10 +1,12 @@
 """Queries on the jobs table. Each one is an explicit statement; callers own the transaction."""
 
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import ColumnElement, Row, func, insert, literal, select, tuple_, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.dml import ReturningUpdate
 
@@ -35,6 +37,65 @@ async def insert_job(
     )
     row = (await session.execute(statement)).one()
     return row.id, row.status
+
+
+@dataclass(frozen=True)
+class KeyedJob:
+    """The job an idempotency key names, and whether this call saved it."""
+
+    id: uuid.UUID
+    status: str
+    created: bool
+    # The fingerprint stored with the key: the caller's own if `created`, else the first request's.
+    # Never NULL for a keyed job (ck_jobs_idempotency_key_has_hash).
+    request_hash: bytes | None
+
+
+async def insert_job_or_find_by_key(
+    session: AsyncSession,
+    *,
+    job_type: str,
+    payload_version: int,
+    payload: dict[str, Any],
+    max_attempts: int,
+    idempotency_key: str,
+    request_hash: bytes,
+) -> KeyedJob:
+    """Insert a job under `idempotency_key`, or return the job already saved under it.
+
+    Two statements in the caller's transaction (ADR 0007 decision 5). Under READ COMMITTED, an
+    INSERT that meets the key in another transaction not committed yet waits for it: on its
+    COMMIT this INSERT does nothing and the SELECT, with a new snapshot, finds that job; on its
+    rollback this INSERT goes ahead. Comparing the fingerprints is the caller's business.
+    """
+    statement = (
+        pg_insert(Job)
+        .values(
+            type=job_type,
+            payload_version=payload_version,
+            payload=payload,
+            max_attempts=max_attempts,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+        )
+        # Only a conflict on the key is absorbed; any other constraint still raises.
+        .on_conflict_do_nothing(index_elements=[Job.idempotency_key])
+        .returning(Job.id, Job.status)
+    )
+    inserted = (await session.execute(statement)).one_or_none()
+    if inserted is not None:
+        return KeyedJob(inserted.id, inserted.status, created=True, request_hash=request_hash)
+
+    # Never the payload (see select_job). Jobs are never deleted, so the job that holds the key
+    # is still there; .one() turns a missing row into an error rather than a wrong answer.
+    existing = (
+        await session.execute(
+            select(Job.id, Job.status, Job.request_hash).where(
+                Job.idempotency_key == idempotency_key
+            )
+        )
+    ).one()
+    return KeyedJob(existing.id, existing.status, created=False, request_hash=existing.request_hash)
 
 
 # id, type, payload_version, status, attempts, max_attempts, available_at, created_at, updated_at,

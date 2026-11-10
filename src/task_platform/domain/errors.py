@@ -14,6 +14,7 @@ class ErrorCode(StrEnum):
     PAYLOAD_TOO_LARGE = "payload_too_large"
     INVALID_PAYLOAD = "invalid_payload"
     JOB_NOT_FOUND = "job_not_found"
+    IDEMPOTENCY_KEY_REUSED = "idempotency_key_reused"
 
 
 class DomainError(Exception):
@@ -76,3 +77,14 @@ class JobNotFoundError(DomainError):
     def __init__(self) -> None:
         # The id is client input, so it is not repeated here.
         super().__init__("job not found")
+
+
+class IdempotencyKeyReusedError(DomainError):
+    """The key already names a job submitted with a different type, version or payload."""
+
+    code = ErrorCode.IDEMPOTENCY_KEY_REUSED
+
+    def __init__(self) -> None:
+        # The key is client input, and the first request's contents are someone else's: neither
+        # is repeated here (ADR 0007 decision 2).
+        super().__init__("idempotency key was already used for a different request")

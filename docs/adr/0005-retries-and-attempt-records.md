@@ -1,6 +1,6 @@
 # ADR 0005 — Retries and attempt records
 
-- **Status:** Accepted
+- **Status:** Accepted (updated 2026-11-10)
 - **Date:** 2026-11-05
 
 ## Context
@@ -57,6 +57,12 @@ Four questions remain:
 7. **No backfill.** Jobs that ran before `job_attempts` existed have no attempt rows; their history
    starts with the migration. Their claim times are not stored anywhere, so a backfill would have to
    invent them.
+
+**Update 2026-11-10 (phase 7):** the consequence that a retry repeats the handler's side effects
+no longer holds for `notification.send`: a retry after the provider was called, whether the
+handler then raised or timed out, gets the same notification back and records nothing new (ADR
+0007 decision 8; tested for both codes, and end to end with three attempts that each reach the
+provider). It still holds for any future handler whose receiver takes no key.
 
 ## Consequences
 

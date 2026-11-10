@@ -20,10 +20,10 @@ from task_platform.domain import job_status, retries
 from task_platform.domain.errors import InvalidTransitionError
 from task_platform.domain.failures import FailureCode
 from task_platform.domain.job_status import JobStatus
-from task_platform.domain.payloads import NOTIFICATION_SEND, PayloadModel
+from task_platform.domain.payloads import NOTIFICATION_SEND, NotificationSendV1, PayloadModel
 from task_platform.services.execution import ClaimedJob, Handler, Outcome, execute_job
 from task_platform.services.notifications import send_notification
-from tests.integration.rows import insert_job
+from tests.integration.rows import fake_notification_rows, fake_result, insert_job
 from tests.settings import UNREACHABLE_BROKER_URL, make_test_broker_settings
 
 pytestmark = pytest.mark.integration
@@ -98,10 +98,18 @@ async def test_a_due_job_is_claimed_run_and_succeeds(
     assert await execute_job(sessions, job_id, HANDLERS, settings) == Outcome.SUCCEEDED
 
     row = await job_row(engine, job_id)
-    assert (row["status"], row["attempts"], row["result"]) == ("succeeded", 1, {"provider": "fake"})
+    [notification] = await fake_notification_rows(engine, job_id)
+    assert (row["status"], row["attempts"], row["result"]) == (
+        "succeeded",
+        1,
+        fake_result(notification),
+    )
     assert row["lease_expires_at"] is None
     assert row["error_code"] is None
-    assert await notifications(engine, job_id) == [1]
+    assert (notification["attempt"], notification["idempotency_key"]) == (
+        1,
+        f"notification.send:{job_id}",
+    )
     [attempt] = await attempts(engine, job_id)
     assert (attempt["outcome"], attempt["error_code"]) == ("succeeded", None)
     # Closed in the transaction of the job's final update.
@@ -712,6 +720,84 @@ async def test_a_stale_attempt_keeps_its_side_effect_but_not_its_outcome(
     # Nor its history: the stale attempt's row stays open, for recovery to close (phase 8).
     [attempt] = await attempts(engine, job_id)
     assert (attempt["attempt"], attempt["finished_at"], attempt["outcome"]) == (1, None, None)
+
+
+async def test_a_newer_attempt_after_a_stale_one_gets_the_same_notification(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    settings: BrokerSettings,
+) -> None:
+    # Fencing cannot stop the stale attempt's call; the provider's key makes the newer attempt's
+    # call the same notification (ADR 0007 decision 8).
+    job_id = await insert_due_job(engine)
+
+    async def overtaken(
+        session_factory: async_sessionmaker[AsyncSession], job: ClaimedJob, payload: PayloadModel
+    ) -> dict[str, Any]:
+        result = await send_notification(session_factory, job, payload)
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("UPDATE jobs SET attempts = attempts + 1 WHERE id = :id"), {"id": job.id}
+            )
+        return result
+
+    assert (
+        await execute_job(sessions, job_id, {NOTIFICATION_SEND: overtaken}, settings)
+        == Outcome.STALE
+    )
+    # The newer attempt's handler, as its worker would run it.
+    newer = await send_notification(
+        sessions, ClaimedJob(id=job_id, attempt=2), NotificationSendV1.model_validate(PAYLOAD)
+    )
+
+    [notification] = await fake_notification_rows(engine, job_id)
+    assert newer == fake_result(notification)
+    assert notification["attempt"] == 1
+
+
+@pytest.mark.parametrize("failure", ["handler_error", "handler_timeout"])
+async def test_a_retry_after_the_provider_was_called_sends_nothing_new(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    test_database_url: str,
+    failure: str,
+) -> None:
+    # Attempt 1 reaches the provider, then fails in a way that is retried; attempt 2 succeeds.
+    # The job ends with one notification, and its result names it (ADR 0007 decisions 8 and 9).
+    # The timeout also covers the provider's own transaction, which must commit before it fires:
+    # 1 s, not 0.1 s, so a slow machine does not cancel attempt 1 before its notification exists.
+    settings = make_test_broker_settings(
+        test_database_url, UNREACHABLE_BROKER_URL, handler_timeout_s=1.0, lease_duration_s=10
+    )
+
+    async def sends_then_fails(
+        session_factory: async_sessionmaker[AsyncSession], job: ClaimedJob, payload: PayloadModel
+    ) -> dict[str, Any]:
+        await send_notification(session_factory, job, payload)
+        if failure == "handler_timeout":
+            await asyncio.Event().wait()
+        raise RuntimeError("after the provider call")
+
+    job_id = await insert_due_job(engine)
+    async with asyncio.timeout(5):
+        first = await execute_job(
+            sessions, job_id, {NOTIFICATION_SEND: sends_then_fails}, settings, jitter=fixed(0)
+        )
+    second = await execute_job(sessions, job_id, HANDLERS, settings)
+
+    assert (first, second) == (Outcome.RETRY_SCHEDULED, Outcome.SUCCEEDED)
+    row = await job_row(engine, job_id)
+    [notification] = await fake_notification_rows(engine, job_id)
+    assert (row["status"], row["attempts"], row["result"]) == (
+        "succeeded",
+        2,
+        fake_result(notification),
+    )
+    assert notification["attempt"] == 1
+    assert [(a["attempt"], a["error_code"]) for a in await attempts(engine, job_id)] == [
+        (1, failure),
+        (2, None),
+    ]
 
 
 async def test_an_attempt_without_a_row_still_finishes_the_job(

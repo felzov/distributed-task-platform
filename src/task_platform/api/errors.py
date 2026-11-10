@@ -64,6 +64,9 @@ DOMAIN_ERROR_STATUS: Final[Mapping[ErrorCode, int]] = MappingProxyType(
         # Not raised by any endpoint yet; a request that conflicts with the job's state.
         ErrorCode.INVALID_TRANSITION: status.HTTP_409_CONFLICT,
         ErrorCode.JOB_NOT_FOUND: status.HTTP_404_NOT_FOUND,
+        # As the IETF draft on idempotency keys (ADR 0007 decision 6): the request is well formed,
+        # but its key names a different one.
+        ErrorCode.IDEMPOTENCY_KEY_REUSED: status.HTTP_422_UNPROCESSABLE_CONTENT,
     }
 )
 
