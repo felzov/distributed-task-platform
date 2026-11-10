@@ -36,9 +36,11 @@ calls the provider again until phase 7). Each gets a dated update when the code 
 The header contract follows the IETF draft `draft-ietf-httpapi-idempotency-key-header-08`
 (2026-10-22, an active Internet-Draft, not an RFC), read on 2026-11-09, where decisions 2–6 cite
 it; decision 5 departs from it on purpose. Behaviour marked "documentation" is taken from the
-PostgreSQL documentation, not observed here. Phase 7's later slices test two of these claims:
-that jobs without a key do not conflict (migration 0005's tests) and that concurrent requests with
-one key end with one job (the insert-or-find query's tests). The rest stays untested.
+PostgreSQL documentation, not observed here. Phase 7's later slices observe some of these claims:
+that jobs without a key do not conflict (migration 0005's tests), and that an insert waits for an
+uncommitted insert of its key, then finds that job, or saves its own if the first one rolls back
+(the insert-or-find query's tests, and the same for the fake provider's key). The wait's bound by
+`DB_STATEMENT_TIMEOUT_MS` and the lock levels stay untested.
 
 ## Decision
 

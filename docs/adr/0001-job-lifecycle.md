@@ -1,6 +1,6 @@
 # ADR 0001 — Job lifecycle and state transitions
 
-- **Status:** Accepted (updated 2026-11-07)
+- **Status:** Accepted (updated 2026-11-07, 2026-11-10)
 - **Date:** 2026-10-24
 
 ## Context
@@ -93,6 +93,13 @@ has an attempt left for its next claim. As decision 5 requires, the same update 
 `available_at`, clears `dispatched_at`, and also clears the lease. The test from the phase 4 update
 now covers five writes, the retry included; removing its status condition, its attempt fence or
 its budget condition made a test fail (checked once by editing the code).
+
+**Update 2026-11-10 (phase 7):** the consequence that handlers with side effects must be idempotent
+is met for the one handler, `notification.send`, by ADR 0007: it gives the provider a key per job,
+and the provider records one notification per key. Fencing still rejects only database writes; a
+stale attempt still calls the provider, but its call and the newer attempt's are one
+notification (tested by running a newer attempt's handler after a stale one). A future handler
+whose receiver takes no key needs a decision of its own (ADR 0007, consequences).
 
 ## Consequences
 
