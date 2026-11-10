@@ -26,8 +26,9 @@ async def test_defaults_come_from_postgres(engine: AsyncEngine) -> None:
     assert notification["created_at"].tzinfo is not None
 
 
-async def test_duplicate_calls_are_all_recorded(engine: AsyncEngine) -> None:
-    # No unique key on purpose: duplicate side effects must be visible (phase 7 adds the guard).
+async def test_calls_without_a_key_are_all_recorded(engine: AsyncEngine) -> None:
+    # Rows recorded before migration 0006 have no key: NULLs are distinct, so their duplicates
+    # stay (ADR 0007 decision 8).
     job = await insert_job(engine)
     async with engine.begin() as connection:
         for _ in range(2):
@@ -58,3 +59,19 @@ async def test_required_columns_reject_null(engine: AsyncEngine, column: str) ->
     with pytest.raises(IntegrityError, match=f'column "{column}" .* violates not-null'):
         async with engine.begin() as connection:
             await connection.execute(INSERT, values)
+
+
+async def test_a_key_is_used_once(engine: AsyncEngine) -> None:
+    # Whichever job or attempt: one key is one notification (migration 0006).
+    first_job = await insert_job(engine)
+    second_job = await insert_job(engine)
+    keyed = text(
+        "INSERT INTO fake_notifications (job_id, attempt, idempotency_key)"
+        " VALUES (:job_id, :attempt, 'key-1')"
+    )
+    async with engine.begin() as connection:
+        await connection.execute(keyed, {"job_id": first_job["id"], "attempt": 1})
+    for job_id, attempt in [(first_job["id"], 2), (second_job["id"], 1)]:
+        with pytest.raises(IntegrityError, match="uq_fake_notifications_idempotency_key"):
+            async with engine.begin() as connection:
+                await connection.execute(keyed, {"job_id": job_id, "attempt": attempt})

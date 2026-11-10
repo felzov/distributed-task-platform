@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from task_platform.data.db import create_db_engine
 from task_platform.data.jobs import KeyedJob, insert_job, insert_job_or_find_by_key
+from tests.integration.locks import wait_until_blocked_by
 from tests.integration.rows import insert_job as insert_raw_job
 from tests.settings import make_test_settings
 
@@ -197,24 +198,6 @@ async def test_an_insert_saves_the_job_if_the_first_insert_of_its_key_rolls_back
     assert second.request_hash == OTHER_HASH
     rows = await job_rows(engine)
     assert [(row["id"], row["request_hash"]) for row in rows] == [(second.id, OTHER_HASH)]
-
-
-async def wait_until_blocked_by(engine: AsyncEngine, pid: int) -> None:
-    """Return once a backend waits for a lock held by backend `pid`; fail after 5 s."""
-    async with asyncio.timeout(5), engine.connect() as connection:
-        while True:
-            blocked = await connection.scalar(
-                text(
-                    "SELECT count(*) FROM pg_stat_activity"
-                    " WHERE CAST(:pid AS integer) = ANY(pg_blocking_pids(pid))"
-                ),
-                {"pid": pid},
-            )
-            if blocked:
-                return
-            # Each SELECT in its own snapshot of pg_stat_activity.
-            await connection.rollback()
-            await asyncio.sleep(0.02)
 
 
 # Invalid input: other constraint violations still raise

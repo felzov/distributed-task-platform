@@ -58,12 +58,18 @@ class JobAttempt(Base):
 
 
 class FakeNotification(Base):
-    """One call to the fake notification provider (ADR 0004); duplicates are kept on purpose."""
+    """One notification of the fake provider (ADR 0004, ADR 0007 decision 8).
+
+    Calls with one idempotency key share one row. Rows recorded before migration 0006 have no key,
+    one per call, duplicates included.
+    """
 
     __tablename__ = "fake_notifications"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, server_default=FetchedValue())
     # The foreign key lives in migration 0002, like every other constraint.
     job_id: Mapped[uuid.UUID]
+    # The attempt that made the call; with a key, the first call with it.
     attempt: Mapped[int]
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    idempotency_key: Mapped[str | None] = mapped_column(Text)
