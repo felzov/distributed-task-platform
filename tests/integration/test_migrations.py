@@ -45,6 +45,8 @@ async def test_migrations_go_up_down_and_up_again(test_settings: Settings) -> No
         "ix_jobs_failed",
         "uq_jobs_idempotency_key",
         "uq_fake_notifications_idempotency_key",
+        "ix_jobs_lease_expiry",
+        "ix_jobs_dispatched",
     }
 
     await migrate(test_settings, "up", "head")
@@ -90,6 +92,105 @@ async def test_failed_index_is_partial_and_newest_first(test_settings: Settings)
     assert definition is not None
     assert "(updated_at DESC, id DESC)" in definition
     assert "WHERE (status = 'failed'::text)" in definition
+
+
+async def index_definition(settings: Settings, name: str) -> str | None:
+    engine = create_db_engine(settings)
+    try:
+        async with engine.connect() as connection:
+            definition: str | None = await connection.scalar(
+                text("SELECT indexdef FROM pg_indexes WHERE indexname = :name"), {"name": name}
+            )
+            return definition
+    finally:
+        await engine.dispose()
+
+
+async def test_lease_expiry_index_is_partial_on_running_jobs(test_settings: Settings) -> None:
+    await migrate(test_settings, "up", "head")
+
+    definition = await index_definition(test_settings, "ix_jobs_lease_expiry")
+
+    assert definition is not None
+    assert "(lease_expires_at)" in definition
+    assert "WHERE (status = 'running'::text)" in definition
+
+
+async def test_dispatched_index_is_partial_on_published_queued_jobs(
+    test_settings: Settings,
+) -> None:
+    await migrate(test_settings, "up", "head")
+
+    definition = await index_definition(test_settings, "ix_jobs_dispatched")
+
+    assert definition is not None
+    assert "(dispatched_at)" in definition
+    assert "WHERE ((status = 'queued'::text) AND (dispatched_at IS NOT NULL))" in definition
+
+
+# The conditions the two recovery sweeps put on the jobs table (ADR 0008 decisions 1 and 2).
+EXPIRED_LEASES = "SELECT id FROM jobs WHERE status = 'running' AND lease_expires_at < now()"
+OLD_DISPATCHES = (
+    "SELECT id FROM jobs WHERE status = 'queued' AND dispatched_at IS NOT NULL"
+    " AND dispatched_at < now() - interval '10 minutes'"
+)
+
+
+async def test_existing_jobs_are_indexed_by_0007_and_kept_by_its_downgrade(
+    engine: AsyncEngine, test_settings: Settings
+) -> None:
+    # Both indexes are built over the rows already there, and the downgrade drops only the
+    # indexes. The sweeps' own queries are planned against them in the query tests.
+    try:
+        await migrate(test_settings, "down", "0006")
+        assert not {"ix_jobs_lease_expiry", "ix_jobs_dispatched"} & await schema_objects(
+            test_settings
+        )
+        async with engine.begin() as connection:
+            expired = await connection.scalar(
+                text(
+                    "INSERT INTO jobs (type, payload_version, payload, max_attempts, status,"
+                    " attempts, lease_expires_at) VALUES ('notification.send', 1, '{}', 5,"
+                    " 'running', 1, now() - interval '1 hour') RETURNING id"
+                )
+            )
+            lost = await connection.scalar(
+                text(
+                    "INSERT INTO jobs (type, payload_version, payload, max_attempts,"
+                    " dispatched_at) VALUES ('notification.send', 1, '{}', 5,"
+                    " now() - interval '1 hour') RETURNING id"
+                )
+            )
+
+        await migrate(test_settings, "up", "0007")
+        async with engine.begin() as connection:
+            # Planner off the table scan, so the plans show whether the indexes can answer.
+            await connection.execute(text("SET LOCAL enable_seqscan = off"))
+            plans = {
+                query: "\n".join(await connection.scalars(text(f"EXPLAIN {query}")))
+                for query in (EXPIRED_LEASES, OLD_DISPATCHES)
+            }
+            found = {
+                query: list(await connection.scalars(text(query)))
+                for query in (EXPIRED_LEASES, OLD_DISPATCHES)
+            }
+        assert "ix_jobs_lease_expiry" in plans[EXPIRED_LEASES]
+        assert "ix_jobs_dispatched" in plans[OLD_DISPATCHES]
+        assert found == {EXPIRED_LEASES: [expired], OLD_DISPATCHES: [lost]}
+
+        await migrate(test_settings, "down", "0006")
+        assert not {"ix_jobs_lease_expiry", "ix_jobs_dispatched"} & await schema_objects(
+            test_settings
+        )
+        async with engine.connect() as connection:
+            kept = await connection.scalars(
+                text("SELECT id FROM jobs WHERE id IN (:expired, :lost) ORDER BY id"),
+                {"expired": expired, "lost": lost},
+            )
+            assert set(kept) == {expired, lost}
+    finally:
+        # Shared test database: leave it at head, as the tests above do.
+        await migrate(test_settings, "up", "head")
 
 
 async def test_existing_failed_jobs_are_indexed_by_0004_and_kept_by_its_downgrade(
