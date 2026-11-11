@@ -149,6 +149,13 @@ async def take_dead_letter(
     return await take(connection, dead)
 
 
+async def wait_for_ready(connection: AbstractRobustConnection, queue_name: str, count: int) -> None:
+    """Wait until the queue holds exactly `count` ready messages; fail after 10 s."""
+    async with asyncio.timeout(10):
+        while await ready_messages(connection, queue_name) != count:
+            await asyncio.sleep(0.05)
+
+
 async def wait_for(answers: list[str], count: int) -> None:
     async with asyncio.timeout(10):
         while len(answers) < count:
@@ -295,8 +302,10 @@ async def test_a_database_outage_keeps_the_message_without_counting_it(
     assert delivery_counts[:2] == [0, 0]
     assert await job_row(engine, job_id) == before
     # Still in the queue once the worker has stopped, and not dead-lettered: lost and
-    # dead-lettered would look the same from the jobs queue alone.
-    assert await ready_messages(broker_connection, settings.jobs_queue_name) == 1
+    # dead-lettered would look the same from the jobs queue alone. Waited for, not read once: a
+    # delivery the worker still held at stop came back to the quorum queue up to ~0.1 s after
+    # its channel closed (observed on RabbitMQ 4.3.7).
+    await wait_for_ready(broker_connection, settings.jobs_queue_name, 1)
     assert (
         await ready_messages(broker_connection, dead_letter_queue_name(settings.jobs_queue_name))
         == 0
@@ -381,6 +390,9 @@ async def test_a_message_held_by_a_stopped_worker_comes_back_counted(
     async with worker(broker_connection, sessions, settings), asyncio.timeout(5):
         await received.wait()
 
+    # Back in the queue shortly after the channel closed, not at once (see the database outage
+    # test above).
+    await wait_for_ready(broker_connection, settings.jobs_queue_name, 1)
     message = await take(broker_connection, settings.jobs_queue_name)
     assert message.body == encode_job_message(job_id)
     assert (message.headers or {}).get("x-delivery-count") == 1
