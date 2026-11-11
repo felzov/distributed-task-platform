@@ -69,7 +69,8 @@ async def job_row(engine: AsyncEngine, job_id: uuid.UUID) -> dict[str, Any]:
 
 
 async def recover(engine: AsyncEngine, job_id: uuid.UUID) -> None:
-    # What phase 8's stale-job recovery will do to a job whose lease expired (ADR 0001 decision 8).
+    # The part of lease recovery the fence cares about, written directly so the lease need not
+    # expire first. Recovery's own queries meet stale finishes in test_recovery_queries.py.
     async with engine.begin() as connection:
         await connection.execute(
             text(

@@ -6,8 +6,8 @@ applies, moving the job only where the table allows, or leaves the row exactly a
 in the same status is not a transition (ADR 0001 decision 2), so a re-claim of a running job or a
 rewrite of a finished one counts as a violation even though the status does not change. Every row
 is the same apart from its status and passes every other condition of the writes (due, attempts
-left, not yet published, the claimed attempt, a lease), so only the status decides. Some rows are
-therefore ones the code never writes, such as a queued job with a lease.
+left, not yet published, the claimed attempt, an expired lease), so only the status decides. Some
+rows are therefore ones the code never writes, such as a queued job with a lease.
 """
 
 import uuid
@@ -21,10 +21,12 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from task_platform.data.jobs import (
     claim_job,
+    fail_expired_lease,
     mark_dispatched,
     mark_failed,
     mark_retry,
     mark_succeeded,
+    requeue_expired_lease,
 )
 from task_platform.domain.failures import FailureCode
 from task_platform.domain.job_status import ALLOWED_TRANSITIONS, JobStatus
@@ -33,7 +35,6 @@ from tests.integration.rows import insert_job
 pytestmark = pytest.mark.integration
 
 PAST = datetime.now(UTC) - timedelta(hours=3)
-FUTURE = datetime.now(UTC) + timedelta(hours=3)
 # The attempt every row is seeded with, and the one the fenced writes claim to own.
 ATTEMPT = 1
 
@@ -68,12 +69,22 @@ async def retry(session: AsyncSession, job_id: uuid.UUID) -> object:
     )
 
 
+async def requeue_expired(session: AsyncSession, job_id: uuid.UUID) -> object:
+    return await requeue_expired_lease(session, job_id, attempt=ATTEMPT)
+
+
+async def fail_expired(session: AsyncSession, job_id: uuid.UUID) -> object:
+    return await fail_expired_lease(session, job_id, attempt=ATTEMPT)
+
+
 WRITES: dict[str, Write] = {
     "claim_job": claim,
     "mark_dispatched": dispatch,
     "mark_succeeded": succeed,
     "mark_failed": fail,
     "mark_retry": retry,
+    "requeue_expired_lease": requeue_expired,
+    "fail_expired_lease": fail_expired,
 }
 
 # Where each write applies, and the status it leaves. Every other pair must not touch the row. Kept
@@ -85,6 +96,8 @@ APPLIES: dict[tuple[str, JobStatus], JobStatus] = {
     ("mark_succeeded", JobStatus.RUNNING): JobStatus.SUCCEEDED,
     ("mark_failed", JobStatus.RUNNING): JobStatus.FAILED,
     ("mark_retry", JobStatus.RUNNING): JobStatus.QUEUED,
+    ("requeue_expired_lease", JobStatus.RUNNING): JobStatus.QUEUED,
+    ("fail_expired_lease", JobStatus.RUNNING): JobStatus.FAILED,
 }
 # The only writes allowed to apply without a transition. Any other write that keeps the status
 # while changing the row is a re-claim or a rewrite, even if APPLIES were edited to allow it.
@@ -97,8 +110,10 @@ async def seed(engine: AsyncEngine, status: JobStatus) -> uuid.UUID:
         "attempts": ATTEMPT,
         "available_at": PAST,
         # The schema requires a lease only for running, but every row gets one, so a finish fenced
-        # by the lease instead of the status fails here.
-        "lease_expires_at": FUTURE,
+        # by the lease instead of the status fails here. Expired, so lease recovery's condition
+        # holds too; a worker's finish does not look at the lease, so it still applies (ADR 0008
+        # decision 1: until the sweep runs, a worker whose lease expired can still finish).
+        "lease_expires_at": PAST,
         # dispatched_at stays NULL on every row, finished ones too, so only mark_dispatched's status
         # condition can refuse them. A realistic published row would hide that condition.
     }

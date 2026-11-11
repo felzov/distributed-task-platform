@@ -321,11 +321,73 @@ async def mark_retry(
     return (await session.scalar(statement)) is not None
 
 
+# id, attempts (the attempt whose lease expired), max_attempts (the job's own budget)
+ExpiredLeaseRow = Row[uuid.UUID, int, int]
+
+
+async def select_expired_leases(session: AsyncSession, *, limit: int) -> list[ExpiredLeaseRow]:
+    """Lock and return up to `limit` running jobs whose lease has expired, earliest expiry first.
+
+    The rows stay locked until the caller's transaction ends; rows another transaction holds are
+    skipped, not waited for, so concurrent sweeps never recover the same job (ADR 0008 decision
+    1). A worker that is still finishing such a job holds its row too, and is skipped the same way.
+    """
+    # Never the payload: result rows are logged at DEBUG.
+    statement = (
+        select(Job.id, Job.attempts, Job.max_attempts)
+        .where(
+            # Inline, so a generic plan can still use ix_jobs_lease_expiry (see _has_status).
+            _has_status(JobStatus.RUNNING),
+            Job.lease_expires_at < func.now(),
+        )
+        .order_by(Job.lease_expires_at)
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+    return list((await session.execute(statement)).all())
+
+
+async def requeue_expired_lease(session: AsyncSession, job_id: uuid.UUID, *, attempt: int) -> bool:
+    """Requeue a job whose `attempt` lease expired, due now; False if that no longer describes it.
+
+    No backoff: the lease already ran its full length since the claim (ADR 0008 decision 1). False
+    also if `attempt` was the job's last: a requeued job always has an attempt left.
+    """
+    statement = (
+        _expired_lease(job_id, attempt)
+        .where(Job.attempts < Job.max_attempts)
+        .values(
+            status=JobStatus.QUEUED,
+            error_code=FailureCode.LEASE_EXPIRED,
+            available_at=func.now(),
+            # Unpublished again, so the dispatcher's next poll publishes it.
+            dispatched_at=None,
+        )
+    )
+    return (await session.scalar(statement)) is not None
+
+
+async def fail_expired_lease(session: AsyncSession, job_id: uuid.UUID, *, attempt: int) -> bool:
+    """Fail a job whose `attempt` lease expired; False if that no longer describes it."""
+    statement = _expired_lease(job_id, attempt).values(
+        status=JobStatus.FAILED, error_code=FailureCode.LEASE_EXPIRED
+    )
+    return (await session.scalar(statement)) is not None
+
+
+def _expired_lease(job_id: uuid.UUID, attempt: int) -> ReturningUpdate[tuple[uuid.UUID]]:
+    # Fenced like a worker's finish, to the attempt the sweep read, and with the lease checked
+    # again: the update states every condition of the recovery itself (ADR 0008 decision 1) rather
+    # than rely on the row lock select_expired_leases took, so a caller without that lock still
+    # cannot recover a job that finished, was claimed again, or whose lease has not run out.
+    return _fenced_finish(job_id, attempt).where(Job.lease_expires_at < func.now())
+
+
 def _fenced_finish(job_id: uuid.UUID, claimed_attempt: int) -> ReturningUpdate[tuple[uuid.UUID]]:
     # Fenced (ADR 0001 decision 7): if the job was recovered and claimed again, or this attempt
     # already finished, no row matches and the stale write is discarded. Used by every write that
-    # ends an attempt, a retry included. The callers add their own columns and conditions; UPDATE
-    # merges repeated .values() and .where().
+    # ends an attempt, a retry and lease recovery included. The callers add their own columns and
+    # conditions; UPDATE merges repeated .values() and .where().
     return (
         update(Job)
         .where(Job.id == job_id, Job.status == JobStatus.RUNNING, Job.attempts == claimed_attempt)
