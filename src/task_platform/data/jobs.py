@@ -383,6 +383,62 @@ def _expired_lease(job_id: uuid.UUID, attempt: int) -> ReturningUpdate[tuple[uui
     return _fenced_finish(job_id, attempt).where(Job.lease_expires_at < func.now())
 
 
+async def select_lost_message_job_ids(
+    session: AsyncSession, *, lost_after_s: float, limit: int
+) -> list[uuid.UUID]:
+    """Lock and return up to `limit` queued jobs published more than `lost_after_s` ago, the
+    earliest publish first.
+
+    Such a job's message was lost or died before any claim, or still waits in a backlog: the
+    caller tells these apart by the queue (ADR 0008 decision 2). The rows stay locked until the
+    caller's transaction ends; rows another transaction holds are skipped, not waited for, so
+    concurrent sweeps never get the same job.
+    """
+    # Ids only: result rows are logged at DEBUG.
+    statement = (
+        select(Job.id)
+        .where(
+            # Inline, so a generic plan can still use ix_jobs_dispatched (see _has_status).
+            _has_status(JobStatus.QUEUED),
+            Job.dispatched_at < _ago(lost_after_s),
+        )
+        .order_by(Job.dispatched_at)
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+    return list(await session.scalars(statement))
+
+
+async def clear_lost_dispatches(
+    session: AsyncSession, job_ids: list[uuid.UUID], *, lost_after_s: float
+) -> list[uuid.UUID]:
+    """Mark these jobs unpublished again, so the dispatcher's next poll publishes them. Returns the
+    ids of the rows updated.
+
+    Only jobs still `queued` and published more than `lost_after_s` ago are updated: the update
+    states the recovery's conditions itself, as lease recovery's does, rather than rely on the row
+    locks of `select_lost_message_job_ids`.
+    """
+    if not job_ids:
+        return []
+    statement = (
+        update(Job)
+        .where(
+            Job.id.in_(job_ids),
+            Job.status == JobStatus.QUEUED,
+            Job.dispatched_at < _ago(lost_after_s),
+        )
+        .values(dispatched_at=None, updated_at=func.now())
+        .returning(Job.id)
+    )
+    return list(await session.scalars(statement))
+
+
+def _ago(seconds: float) -> ColumnElement[datetime]:
+    # A duration from the caller, a timestamp from PostgreSQL's clock (ADR 0001 decision 9).
+    return func.now() - timedelta(seconds=seconds)
+
+
 def _fenced_finish(job_id: uuid.UUID, claimed_attempt: int) -> ReturningUpdate[tuple[uuid.UUID]]:
     # Fenced (ADR 0001 decision 7): if the job was recovered and claimed again, or this attempt
     # already finished, no row matches and the stale write is discarded. Used by every write that

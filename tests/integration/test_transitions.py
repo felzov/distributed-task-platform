@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from task_platform.data.jobs import (
     claim_job,
+    clear_lost_dispatches,
     fail_expired_lease,
     mark_dispatched,
     mark_failed,
@@ -77,6 +78,10 @@ async def fail_expired(session: AsyncSession, job_id: uuid.UUID) -> object:
     return await fail_expired_lease(session, job_id, attempt=ATTEMPT)
 
 
+async def clear_lost(session: AsyncSession, job_id: uuid.UUID) -> object:
+    return await clear_lost_dispatches(session, [job_id], lost_after_s=60)
+
+
 WRITES: dict[str, Write] = {
     "claim_job": claim,
     "mark_dispatched": dispatch,
@@ -85,6 +90,7 @@ WRITES: dict[str, Write] = {
     "mark_retry": retry,
     "requeue_expired_lease": requeue_expired,
     "fail_expired_lease": fail_expired,
+    "clear_lost_dispatches": clear_lost,
 }
 
 # Where each write applies, and the status it leaves. Every other pair must not touch the row. Kept
@@ -98,13 +104,15 @@ APPLIES: dict[tuple[str, JobStatus], JobStatus] = {
     ("mark_retry", JobStatus.RUNNING): JobStatus.QUEUED,
     ("requeue_expired_lease", JobStatus.RUNNING): JobStatus.QUEUED,
     ("fail_expired_lease", JobStatus.RUNNING): JobStatus.FAILED,
+    ("clear_lost_dispatches", JobStatus.QUEUED): JobStatus.QUEUED,
 }
 # The only writes allowed to apply without a transition. Any other write that keeps the status
 # while changing the row is a re-claim or a rewrite, even if APPLIES were edited to allow it.
-STATUS_PRESERVING = frozenset({"mark_dispatched"})
+# clear_lost_dispatches undoes a publish record (lost-message recovery, ADR 0008 decision 2).
+STATUS_PRESERVING = frozenset({"mark_dispatched", "clear_lost_dispatches"})
 
 
-async def seed(engine: AsyncEngine, status: JobStatus) -> uuid.UUID:
+async def seed(engine: AsyncEngine, status: JobStatus, *, published: bool) -> uuid.UUID:
     columns: dict[str, Any] = {
         "status": status,
         "attempts": ATTEMPT,
@@ -116,6 +124,8 @@ async def seed(engine: AsyncEngine, status: JobStatus) -> uuid.UUID:
         "lease_expires_at": PAST,
         # dispatched_at stays NULL on every row, finished ones too, so only mark_dispatched's status
         # condition can refuse them. A realistic published row would hide that condition.
+        # Published long ago for clear_lost_dispatches only, for the same reason the other way.
+        "dispatched_at": PAST if published else None,
     }
     return uuid.UUID(str((await insert_job(engine, **columns))["id"]))
 
@@ -131,7 +141,7 @@ async def stored(engine: AsyncEngine, job_id: uuid.UUID) -> dict[str, Any]:
 async def test_a_write_moves_a_job_only_where_the_domain_allows(
     engine: AsyncEngine, write: str, before: JobStatus
 ) -> None:
-    job_id = await seed(engine, before)
+    job_id = await seed(engine, before, published=write == "clear_lost_dispatches")
     row_before = await stored(engine, job_id)
 
     async with async_sessionmaker(engine).begin() as session:
