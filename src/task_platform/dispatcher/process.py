@@ -2,9 +2,10 @@
 decision 2) and the recovery loop (ADR 0008 decision 3)."""
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Coroutine
-from typing import Any, NoReturn
+from typing import Any
 
 from aio_pika.abc import AbstractConnection
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -22,6 +23,7 @@ from task_platform.services.recovery import (
     recover_expired_leases,
     recover_lost_messages,
 )
+from task_platform.shutdown import Ended, StopSignals, finish_unless_forced
 
 logger = logging.getLogger(__name__)
 
@@ -46,14 +48,16 @@ async def poll_once(
         logger.info("dispatched %d of %d due jobs", poll.dispatched, poll.due)
 
 
-async def poll_forever(
+async def poll_until_stopped(
     session_factory: async_sessionmaker[AsyncSession],
     publisher: Publisher,
     settings: BrokerSettings,
-) -> NoReturn:
-    while True:
+    stop: asyncio.Event,
+) -> None:
+    """Poll every `dispatch_poll_interval_s` until `stop` is set; a poll in hand ends first."""
+    while not stop.is_set():
         await poll_once(session_factory, publisher, settings)
-        await asyncio.sleep(settings.dispatch_poll_interval_s)
+        await _pause(settings.dispatch_poll_interval_s, stop)
 
 
 async def recover_once(
@@ -98,15 +102,25 @@ async def recover_once(
             )
 
 
-async def recover_forever(
+async def recover_until_stopped(
     session_factory: async_sessionmaker[AsyncSession],
     queue: QueueDepth,
     settings: BrokerSettings,
-) -> NoReturn:
+    stop: asyncio.Event,
+) -> None:
+    """A recovery pass every `recovery_interval_s` until `stop` is set; a pass in hand ends
+    first."""
     # The first pass at start: jobs left by a crash wait no longer than they must.
-    while True:
+    while not stop.is_set():
         await recover_once(session_factory, queue, settings)
-        await asyncio.sleep(settings.recovery_interval_s)
+        await _pause(settings.recovery_interval_s, stop)
+
+
+async def _pause(seconds: float, stop: asyncio.Event) -> None:
+    """Sleep, unless `stop` is set first: a stop does not wait for the interval."""
+    with contextlib.suppress(TimeoutError):
+        async with asyncio.timeout(seconds):
+            await stop.wait()
 
 
 async def open_dispatch_publisher(
@@ -124,9 +138,14 @@ async def open_dispatch_publisher(
     )
 
 
-async def run_dispatcher(settings: BrokerSettings) -> NoReturn:
-    """Poll and recover until cancelled. Fails at start if the broker or the queue declaration
-    does."""
+async def run_dispatcher(settings: BrokerSettings, signals: StopSignals) -> None:
+    """Poll and recover until a stop signal or cancellation (ADR 0008 decision 6). Fails at start
+    if the broker or the queue declaration does.
+
+    On the first signal the poll and the sweep in hand end with their COMMIT or ROLLBACK and no
+    new ones start. A second signal cancels them: their transactions roll back, and jobs whose
+    messages were already confirmed are published again on the next start (ADR 0002 decision 5).
+    """
     # First, and before the broker: creating the engine does no I/O, so a database outage only
     # fails polls, and a bad URL fails here with no connection left open.
     engine = create_db_engine(settings)
@@ -139,7 +158,21 @@ async def run_dispatcher(settings: BrokerSettings) -> NoReturn:
         # A reader of its own, on a channel nothing else declares the queue on (ADR 0008
         # decision 2).
         queue = ReadyCount(connection, settings.jobs_queue_name)
-        await poll_and_recover(sessions, publisher, queue, settings)
+        work = poll_and_recover(sessions, publisher, queue, settings, signals.stop)
+        ended = await finish_unless_forced(work, signals.force, timeout_s=None)
+        if ended is Ended.FINISHED:
+            logger.info("dispatcher stopped")
+        elif ended is Ended.CANCELLED:
+            logger.warning(
+                "dispatcher stopped on a second signal: the poll or sweep in hand was cancelled"
+                " and rolled back"
+            )
+        else:
+            # Its cleanup failure is logged; the database rolls back what never committed.
+            logger.warning(
+                "dispatcher stopped on a second signal: the poll or sweep in hand was cancelled"
+                " and its cleanup failed"
+            )
     finally:
         await engine.dispose()
         await connection.close()
@@ -150,18 +183,23 @@ async def poll_and_recover(
     publisher: Publisher,
     queue: QueueDepth,
     settings: BrokerSettings,
-) -> NoReturn:
-    """Run the poll loop and the recovery loop side by side until cancelled."""
-    # Neither loop returns or raises (each logs its failures), so only cancellation ends the
-    # group, and it cancels both. A bug that escaped one would cancel the other too.
+    stop: asyncio.Event,
+) -> None:
+    """Run the poll loop and the recovery loop side by side until `stop` is set or cancelled."""
+    # Neither loop raises (each logs its failures), so they end together on `stop`, or on
+    # cancellation, which cancels both. A bug that escaped one would cancel the other too.
     async with asyncio.TaskGroup() as loops:
-        loops.create_task(_until_cancelled("poll", poll_forever(sessions, publisher, settings)))
-        loops.create_task(_until_cancelled("recovery", recover_forever(sessions, queue, settings)))
-    raise RuntimeError("the dispatcher's loops ended")
+        loops.create_task(
+            _until_cancelled("poll", poll_until_stopped(sessions, publisher, settings, stop))
+        )
+        loops.create_task(
+            _until_cancelled("recovery", recover_until_stopped(sessions, queue, settings, stop))
+        )
 
 
-async def _until_cancelled(name: str, loop: Coroutine[Any, Any, NoReturn]) -> NoReturn:
-    """Run one of the group's loops, letting only a cancellation that was asked for end it.
+async def _until_cancelled(name: str, loop: Coroutine[Any, Any, None]) -> None:
+    """Run one of the group's loops, letting only a stop or a cancellation that was asked for end
+    it.
 
     A TaskGroup ignores a child that ends cancelled without being cancelled, and the other loop
     goes on: a CancelledError raised from inside would stop this loop with nothing logged. The

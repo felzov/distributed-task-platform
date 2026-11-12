@@ -1,5 +1,6 @@
 """The dispatcher's loops without a database or broker: a failed poll or sweep is logged and the
-loop goes on; a loop cancelled from inside stops the dispatcher."""
+loop goes on; a stop ends a loop after its pass; a loop cancelled from inside stops the
+dispatcher."""
 
 import asyncio
 import logging
@@ -12,7 +13,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from task_platform.data.db import create_db_engine
 from task_platform.dispatcher import process
-from task_platform.dispatcher.process import poll_and_recover, poll_forever, recover_forever
+from task_platform.dispatcher.process import (
+    poll_and_recover,
+    poll_until_stopped,
+    recover_until_stopped,
+)
 from tests.settings import (
     UNREACHABLE_BROKER_URL,
     UNREACHABLE_DATABASE_URL,
@@ -36,7 +41,9 @@ async def test_the_loop_keeps_polling_while_the_database_is_down(
     )
     engine = create_db_engine(settings)
     loop = asyncio.create_task(
-        poll_forever(async_sessionmaker(engine), NeverCalledPublisher(), settings)
+        poll_until_stopped(
+            async_sessionmaker(engine), NeverCalledPublisher(), settings, asyncio.Event()
+        )
     )
     try:
         async with asyncio.timeout(5):
@@ -86,7 +93,7 @@ async def test_the_recovery_loop_keeps_sweeping_while_the_database_and_broker_ar
         return [r for r in caplog.records if r.getMessage().startswith("lease recovery failed")]
 
     loop = asyncio.create_task(
-        recover_forever(async_sessionmaker(engine), HangingCount(), settings)
+        recover_until_stopped(async_sessionmaker(engine), HangingCount(), settings, asyncio.Event())
     )
     try:
         async with asyncio.timeout(5):
@@ -130,7 +137,9 @@ async def test_a_failed_lease_sweep_does_not_stop_the_lost_message_sweep(
         UNREACHABLE_DATABASE_URL, UNREACHABLE_BROKER_URL, recovery_interval_s=INTERVAL_S
     )
     engine = create_db_engine(settings)
-    loop = asyncio.create_task(recover_forever(async_sessionmaker(engine), EmptyCount(), settings))
+    loop = asyncio.create_task(
+        recover_until_stopped(async_sessionmaker(engine), EmptyCount(), settings, asyncio.Event())
+    )
     try:
         async with asyncio.timeout(5):
             while "lost-message recovery failed" not in caplog.text:
@@ -171,7 +180,11 @@ async def test_a_loop_cancelled_from_inside_stops_the_dispatcher(
         async with asyncio.timeout(5):
             with pytest.raises(ExceptionGroup) as stopped:
                 await poll_and_recover(
-                    async_sessionmaker(engine), NeverCalledPublisher(), EmptyCount(), settings
+                    async_sessionmaker(engine),
+                    NeverCalledPublisher(),
+                    EmptyCount(),
+                    settings,
+                    asyncio.Event(),
                 )
     finally:
         await engine.dispose()
@@ -185,3 +198,41 @@ async def test_a_loop_cancelled_from_inside_stops_the_dispatcher(
             "the recovery loop ended with a cancellation nobody asked for",
         )
     ]
+
+
+@pytest.mark.parametrize("loop_name", ["poll", "recovery"])
+async def test_a_stop_ends_the_loop_after_its_pass_without_waiting_for_the_interval(
+    caplog: pytest.LogCaptureFixture, loop_name: str
+) -> None:
+    # ADR 0008 decision 6: an hour between passes, yet the stop takes effect at once.
+    settings = make_test_broker_settings(
+        UNREACHABLE_DATABASE_URL,
+        UNREACHABLE_BROKER_URL,
+        dispatch_poll_interval_s=3600,
+        recovery_interval_s=3600,
+        publish_timeout_s=0.05,
+    )
+    engine = create_db_engine(settings)
+    stop = asyncio.Event()
+    sessions = async_sessionmaker(engine)
+    if loop_name == "poll":
+        work = poll_until_stopped(sessions, NeverCalledPublisher(), settings, stop)
+        first_pass = "dispatch poll failed"
+    else:
+        work = recover_until_stopped(sessions, EmptyCount(), settings, stop)
+        first_pass = "lost-message recovery failed"
+    loop = asyncio.create_task(work)
+    try:
+        async with asyncio.timeout(5):
+            while first_pass not in caplog.text:
+                await asyncio.sleep(0.01)
+        stop.set()
+        async with asyncio.timeout(1):
+            await loop
+    finally:
+        loop.cancel()
+        await asyncio.wait({loop})
+        await engine.dispose()
+
+    # One pass only: the stop came during the pause, and no pass started after it.
+    assert caplog.text.count(first_pass) == 1

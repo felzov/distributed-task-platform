@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import signal
 import uuid
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
@@ -18,9 +19,11 @@ from task_platform.broker.topology import declare_jobs_queue
 from task_platform.config import BrokerSettings
 from task_platform.data.db import create_db_engine
 from task_platform.dispatcher import process
-from task_platform.dispatcher.process import poll_forever, recover_once, run_dispatcher
+from task_platform.dispatcher.process import poll_until_stopped, recover_once, run_dispatcher
 from task_platform.domain.messages import encode_job_message
 from task_platform.services.dispatch import DispatchPoll, dispatch_due_jobs
+from task_platform.shutdown import StopSignals
+from tests.integration.processes import stop_with_signal
 from tests.integration.rows import insert_job
 from tests.settings import make_test_broker_settings
 
@@ -136,7 +139,7 @@ async def test_the_loop_goes_on_after_a_failed_poll(
     job_id = (await insert_job(engine))["id"]
     publisher = FailsOncePublisher()
 
-    loop = asyncio.create_task(poll_forever(sessions, publisher, settings))
+    loop = asyncio.create_task(poll_until_stopped(sessions, publisher, settings, asyncio.Event()))
     try:
         await wait_until_dispatched(engine, job_id)
     finally:
@@ -207,7 +210,7 @@ async def test_the_dispatcher_declares_the_queue_and_publishes_due_jobs(
     monkeypatch.setattr(process, "open_job_publisher", recording_open_job_publisher)
     job_id = (await insert_job(engine))["id"]
 
-    dispatcher = asyncio.create_task(run_dispatcher(settings))
+    dispatcher = asyncio.create_task(run_dispatcher(settings, StopSignals()))
     try:
         await wait_until_dispatched(engine, job_id)
     finally:
@@ -229,7 +232,7 @@ async def test_the_dispatcher_publishes_a_lost_message_again(
     # Queued and published hours ago, with nothing in the queue: its message died before a claim.
     job_id = (await insert_job(engine, dispatched_at=PAST))["id"]
 
-    dispatcher = asyncio.create_task(run_dispatcher(settings))
+    dispatcher = asyncio.create_task(run_dispatcher(settings, StopSignals()))
     try:
         async with asyncio.timeout(5):
             # None in between: cleared, not published yet.
@@ -272,7 +275,7 @@ async def test_cancelling_the_dispatcher_closes_its_connection_and_pool(
     monkeypatch.setattr(process, "create_db_engine", recording_create_db_engine)
     job_id = (await insert_job(engine))["id"]
 
-    dispatcher = asyncio.create_task(run_dispatcher(settings))
+    dispatcher = asyncio.create_task(run_dispatcher(settings, StopSignals()))
     try:
         # One poll done, so the pool holds a connection; the recovery loop may hold a second.
         await wait_until_dispatched(engine, job_id)
@@ -291,3 +294,168 @@ def count_pool_event(counts: dict[str, int], name: str) -> Callable[..., None]:
         counts[name] += 1
 
     return count
+
+
+# Stopping (ADR 0008 decision 6, criterion 9)
+
+
+class GatedPublisher:
+    """The real publisher, entered only when the test lets it: a poll held open on demand."""
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+        self.publisher: JobPublisher | None = None
+
+    async def publish(self, job_ids: Sequence[uuid.UUID]) -> list[uuid.UUID]:
+        self.calls += 1
+        self.entered.set()
+        await self.release.wait()
+        assert self.publisher is not None
+        return await self.publisher.publish(job_ids)
+
+
+@pytest.fixture
+def gated(monkeypatch: pytest.MonkeyPatch) -> GatedPublisher:
+    gate = GatedPublisher()
+    open_real = process.open_dispatch_publisher
+
+    async def open_gated(*args: Any) -> GatedPublisher:
+        gate.publisher = await open_real(*args)
+        return gate
+
+    monkeypatch.setattr(process, "open_dispatch_publisher", open_gated)
+    return gate
+
+
+async def test_a_stop_signal_lets_the_poll_in_hand_commit_and_starts_no_other(
+    engine: AsyncEngine,
+    broker_connection: AbstractRobustConnection,
+    settings: BrokerSettings,
+    gated: GatedPublisher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    job_id = (await insert_job(engine))["id"]
+    signals = StopSignals()
+
+    dispatcher = asyncio.create_task(run_dispatcher(settings, signals))
+    try:
+        async with asyncio.timeout(5):
+            await gated.entered.wait()
+        # Mid-poll: the job's row is locked and its publish not yet confirmed.
+        signals.received(signal.SIGTERM)
+        gated.release.set()
+        async with asyncio.timeout(5):
+            await dispatcher
+    finally:
+        await stop_if_running(dispatcher)
+
+    # The poll committed: the job is marked, and its one message is in the queue.
+    assert await dispatched_at(engine, job_id) is not None
+    channel = await broker_connection.channel()
+    queue = await channel.declare_queue(settings.jobs_queue_name, passive=True)
+    assert await queued_bodies(queue) == [encode_job_message(job_id)]
+    assert gated.calls == 1
+    assert "dispatcher stopped" in caplog.text
+
+
+async def test_a_second_signal_cancels_the_poll_in_hand_and_rolls_it_back(
+    engine: AsyncEngine,
+    broker_connection: AbstractRobustConnection,
+    settings: BrokerSettings,
+    gated: GatedPublisher,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    job_id = (await insert_job(engine))["id"]
+    signals = StopSignals()
+
+    dispatcher = asyncio.create_task(run_dispatcher(settings, signals))
+    try:
+        async with asyncio.timeout(5):
+            await gated.entered.wait()
+        signals.received(signal.SIGTERM)
+        signals.received(signal.SIGINT)
+        # Never released: only the second signal ends the poll.
+        async with asyncio.timeout(5):
+            await dispatcher
+    finally:
+        await stop_if_running(dispatcher)
+
+    # Rolled back, not left open: the row lock is gone, so the next start can take the job.
+    assert await dispatched_at(engine, job_id) is None
+    async with engine.begin() as connection:
+        locked = text("SELECT id FROM jobs WHERE id = :id FOR UPDATE NOWAIT")
+        assert (await connection.execute(locked, {"id": job_id})).scalar_one() == job_id
+    channel = await broker_connection.channel()
+    queue = await channel.declare_queue(settings.jobs_queue_name, passive=True)
+    assert await queued_bodies(queue) == []
+    assert (
+        "dispatcher stopped on a second signal: the poll or sweep in hand was cancelled and"
+        " rolled back"
+    ) in caplog.text
+
+
+async def test_a_stop_signal_lets_the_recovery_sweep_in_hand_commit(
+    engine: AsyncEngine, settings: BrokerSettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A lost message's job (published hours ago, the queue empty): the sweep in hand clears it.
+    job_id = (await insert_job(engine, dispatched_at=PAST))["id"]
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    recover_once = process.recover_once
+
+    async def gated_recover_once(*args: Any) -> None:
+        entered.set()
+        await release.wait()
+        await recover_once(*args)
+
+    monkeypatch.setattr(process, "recover_once", gated_recover_once)
+    signals = StopSignals()
+    dispatcher = asyncio.create_task(run_dispatcher(settings, signals))
+    try:
+        async with asyncio.timeout(5):
+            await entered.wait()
+        signals.received(signal.SIGTERM)
+        release.set()
+        async with asyncio.timeout(5):
+            await dispatcher
+    finally:
+        await stop_if_running(dispatcher)
+
+    # Cleared and committed after the stop; no poll started after it to publish it again.
+    assert await dispatched_at(engine, job_id) is None
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT], ids=["SIGTERM", "SIGINT"])
+async def test_the_dispatcher_process_exits_with_status_0_on_a_signal(
+    engine: AsyncEngine,
+    settings: BrokerSettings,
+    test_database_url: str,
+    test_broker_url: str,
+    signum: signal.Signals,
+) -> None:
+    # The signal handlers python -m task_platform.dispatcher installs: without them SIGTERM would
+    # end it with status -15 and SIGINT with a KeyboardInterrupt traceback.
+    job_id = (await insert_job(engine))["id"]
+    env = {
+        "DATABASE_URL": test_database_url,
+        "BROKER_URL": test_broker_url,
+        "JOBS_QUEUE_NAME": settings.jobs_queue_name,
+    }
+
+    async def polling() -> bool:
+        return await dispatched_at(engine, job_id) is not None
+
+    status, stderr = await stop_with_signal("task_platform.dispatcher", env, polling, signum)
+
+    assert status == 0
+    # Not printed on failure: the child's errors could quote its settings.
+    assert b"Traceback" not in stderr
+
+
+async def stop_if_running(task: asyncio.Task[Any]) -> None:
+    if not task.done():
+        task.cancel()
+        await asyncio.wait({task})

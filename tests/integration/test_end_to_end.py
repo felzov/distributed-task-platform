@@ -19,8 +19,8 @@ from task_platform.broker.connection import connect_broker
 from task_platform.config import BrokerSettings
 from task_platform.dispatcher.process import (
     open_dispatch_publisher,
-    poll_forever,
     poll_once,
+    poll_until_stopped,
     run_dispatcher,
 )
 from task_platform.domain.payloads import NOTIFICATION_SEND, PayloadModel
@@ -189,7 +189,7 @@ async def running(
     try:
         queue = await open_jobs_queue(worker_connection, settings)
         tasks = [
-            asyncio.create_task(poll_forever(sessions, publisher, settings)),
+            asyncio.create_task(poll_until_stopped(sessions, publisher, settings, asyncio.Event())),
             asyncio.create_task(
                 consume_until_stopped(queue, sessions, handlers, settings, StopSignals())
             ),
@@ -475,7 +475,7 @@ async def test_a_job_whose_worker_crashed_is_recovered_and_succeeds_with_one_not
     async with app_client(create_app(make_test_settings(test_database_url))) as client:
         job_id = (await client.post("/jobs", json=JOB)).json()["id"]
         # The whole dispatcher process: poll loop and recovery loop.
-        dispatcher = asyncio.create_task(run_dispatcher(crash_settings))
+        dispatcher = asyncio.create_task(run_dispatcher(crash_settings, StopSignals()))
         try:
             # The first worker sends the notification, then dies before its final update: its
             # task is cancelled and its connection closed, as for a killed process.
