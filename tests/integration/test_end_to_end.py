@@ -28,8 +28,9 @@ from task_platform.main import create_app
 from task_platform.services.dispatch import Publisher
 from task_platform.services.execution import ClaimedJob, Handler
 from task_platform.services.notifications import send_notification
+from task_platform.shutdown import StopSignals
 from task_platform.worker.handlers import HANDLERS
-from task_platform.worker.process import consume_forever, open_jobs_queue
+from task_platform.worker.process import consume_until_stopped, open_jobs_queue
 from tests.app_client import app_client
 from tests.integration.rows import fake_notification_rows, fake_result
 from tests.settings import make_test_broker_settings, make_test_settings
@@ -106,7 +107,9 @@ async def test_a_submitted_job_is_dispatched_run_once_and_reported_succeeded(
         worker_connection = await connect_broker(settings)
         try:
             queue = await open_jobs_queue(worker_connection, settings)
-            worker = asyncio.create_task(consume_forever(queue, sessions, HANDLERS, settings))
+            worker = asyncio.create_task(
+                consume_until_stopped(queue, sessions, HANDLERS, settings, StopSignals())
+            )
             try:
                 status = await wait_until_succeeded(client, job_id)
                 # The worker acks after the final update has committed, so `succeeded` can show
@@ -187,7 +190,9 @@ async def running(
         queue = await open_jobs_queue(worker_connection, settings)
         tasks = [
             asyncio.create_task(poll_forever(sessions, publisher, settings)),
-            asyncio.create_task(consume_forever(queue, sessions, handlers, settings)),
+            asyncio.create_task(
+                consume_until_stopped(queue, sessions, handlers, settings, StopSignals())
+            ),
         ]
         try:
             yield
@@ -478,7 +483,9 @@ async def test_a_job_whose_worker_crashed_is_recovered_and_succeeds_with_one_not
             try:
                 queue = await open_jobs_queue(first_connection, crash_settings)
                 first = asyncio.create_task(
-                    consume_forever(queue, sessions, crashing_handlers(sent), crash_settings)
+                    consume_until_stopped(
+                        queue, sessions, crashing_handlers(sent), crash_settings, StopSignals()
+                    )
                 )
                 async with asyncio.timeout(5):
                     await sent.wait()
@@ -496,7 +503,7 @@ async def test_a_job_whose_worker_crashed_is_recovered_and_succeeds_with_one_not
             try:
                 queue = await open_jobs_queue(second_connection, crash_settings)
                 second = asyncio.create_task(
-                    consume_forever(queue, sessions, HANDLERS, crash_settings)
+                    consume_until_stopped(queue, sessions, HANDLERS, crash_settings, StopSignals())
                 )
                 try:
                     status = await wait_until(client, job_id, "succeeded")

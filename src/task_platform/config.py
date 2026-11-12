@@ -85,6 +85,10 @@ class BrokerSettings(Settings):
     lease_duration_s: float = Field(default=120.0, gt=0, lt=1800)
     # A handler still running after this is cancelled and the job fails as handler_timeout.
     handler_timeout_s: float = Field(default=60.0, gt=0)
+    # How long a stopping worker waits for the job in hand (ADR 0008 decision 5). Shorter than
+    # handler_timeout_s on purpose: a stop should not wait for the slowest handler the timeout
+    # allows. The message stays unacked meanwhile, so the cap is RabbitMQ's consumer_timeout.
+    shutdown_grace_s: float = Field(default=30.0, gt=0, lt=1800)
     # Wait after a database error at the claim, before the message goes back with nack (ADR 0004
     # decision 6). The worker holds the message unacknowledged meanwhile, for the claim's own
     # timeouts plus this wait, so it is capped below RabbitMQ's default consumer_timeout (30 min).

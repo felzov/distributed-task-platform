@@ -378,3 +378,25 @@ def test_recovery_interval_bounds(interval_s: float, accepted: bool) -> None:
     else:
         with pytest.raises(ValidationError, match="recovery_interval_s"):
             broker_settings(**values)
+
+
+@pytest.mark.parametrize(
+    ("grace_s", "accepted"),
+    [
+        (0.001, True),
+        (1799.9, True),
+        (0, False),
+        (1800.0, False),
+        (float("inf"), False),
+        (float("nan"), False),
+    ],
+)
+def test_shutdown_grace_bounds(grace_s: float, accepted: bool) -> None:
+    # ADR 0008 decision 5: the held message stays unacked for the grace period, so it stays below
+    # RabbitMQ's default consumer_timeout of 30 minutes.
+    values = {"database_url": URL, "broker_url": BROKER_URL, "shutdown_grace_s": grace_s}
+    if accepted:
+        assert broker_settings(**values).shutdown_grace_s == grace_s
+    else:
+        with pytest.raises(ValidationError, match="shutdown_grace_s"):
+            broker_settings(**values)

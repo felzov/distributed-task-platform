@@ -21,9 +21,15 @@ from task_platform.config import BrokerSettings
 from task_platform.data.db import create_db_engine
 from task_platform.domain.messages import encode_job_message
 from task_platform.services.execution import Outcome, execute_job
+from task_platform.shutdown import StopSignals
 from task_platform.worker import process
 from task_platform.worker.handlers import HANDLERS
-from task_platform.worker.process import Delivery, consume_forever, open_jobs_queue, run_worker
+from task_platform.worker.process import (
+    Delivery,
+    consume_until_stopped,
+    open_jobs_queue,
+    run_worker,
+)
 from tests.integration.rows import fake_notification_rows, fake_result, insert_job
 from tests.settings import (
     UNREACHABLE_BROKER_URL,
@@ -171,7 +177,9 @@ async def worker(
     """A consumer on a channel of its own, as run_worker sets it up. Closing the channel on exit
     gives the broker back any message the worker had not answered."""
     queue = await open_jobs_queue(connection, settings)
-    task = asyncio.create_task(consume_forever(queue, sessions, HANDLERS, settings))
+    task = asyncio.create_task(
+        consume_until_stopped(queue, sessions, HANDLERS, settings, StopSignals())
+    )
     try:
         yield
     finally:
@@ -459,7 +467,7 @@ async def test_the_worker_process_declares_the_queue_runs_jobs_and_cleans_up(
     monkeypatch.setattr(process, "create_db_engine", recording_create_db_engine)
     job_id = await insert_due_job(engine)
 
-    task = asyncio.create_task(run_worker(settings))
+    task = asyncio.create_task(run_worker(settings, StopSignals()))
     try:
         # The worker declares the queue: before that, a publish would go nowhere.
         await wait_until_queue_exists(broker_connection, settings.jobs_queue_name)
@@ -483,4 +491,4 @@ async def test_the_worker_process_stops_at_start_without_a_broker(test_database_
     settings = make_test_broker_settings(test_database_url, UNREACHABLE_BROKER_URL)
 
     with pytest.raises(ConnectionError):
-        await run_worker(settings)
+        await run_worker(settings, StopSignals())
