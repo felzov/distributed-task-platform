@@ -78,7 +78,8 @@ class BrokerSettings(Settings):
     # Pause after every poll, so at most dispatch_batch_size jobs go out per interval.
     dispatch_poll_interval_s: float = Field(default=1.0, gt=0)
 
-    # How long a claimed job belongs to its worker; phase 8 recovers jobs whose lease expired.
+    # How long a claimed job belongs to its worker; lease recovery takes on a job whose lease
+    # expired (ADR 0008 decision 1).
     # Below RabbitMQ's default consumer_timeout of 30 minutes (ADR 0004 decision 8); the bound
     # also rejects inf and values past PostgreSQL's timestamp range, which would fail every claim.
     lease_duration_s: float = Field(default=120.0, gt=0, lt=1800)
@@ -98,6 +99,9 @@ class BrokerSettings(Settings):
     # messages (ADR 0008 decision 2). A placeholder, not measured. The one-day cap keeps
     # now() - threshold inside PostgreSQL's timestamp range and rejects inf.
     lost_message_after_s: float = Field(default=600.0, gt=0, le=86400)
+    # Pause after every recovery pass: the lease sweep, then the lost-message sweep (ADR 0008
+    # decision 3). A placeholder, not measured. Capped at an hour, which also rejects inf.
+    recovery_interval_s: float = Field(default=30.0, gt=0, le=3600)
 
     @model_validator(mode="after")
     def _publish_timeout_within_statement_timeout(self) -> Self:

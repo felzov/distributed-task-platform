@@ -364,3 +364,17 @@ def test_lost_message_threshold_bounds(threshold_s: float, accepted: bool) -> No
     else:
         with pytest.raises(ValidationError, match="lost_message_after_s"):
             broker_settings(**values)
+
+
+@pytest.mark.parametrize(
+    ("interval_s", "accepted"),
+    [(0.001, True), (3600.0, True), (0, False), (3600.001, False), (float("inf"), False)],
+)
+def test_recovery_interval_bounds(interval_s: float, accepted: bool) -> None:
+    # ADR 0008 decision 3.
+    values = {"database_url": URL, "broker_url": BROKER_URL, "recovery_interval_s": interval_s}
+    if accepted:
+        assert broker_settings(**values).recovery_interval_s == interval_s
+    else:
+        with pytest.raises(ValidationError, match="recovery_interval_s"):
+            broker_settings(**values)

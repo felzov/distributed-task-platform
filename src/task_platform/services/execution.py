@@ -55,7 +55,8 @@ class Outcome(StrEnum):
     FAILED = "failed"
     # A newer attempt owns the job; this attempt's result was discarded.
     STALE = "stale"
-    # The final update could not be written: nack; the job stays running until phase 8.
+    # The final update could not be written: nack; the job stays running until lease recovery
+    # takes it on (ADR 0008 decision 1).
     FINISH_UNAVAILABLE = "finish_unavailable"
 
 
@@ -114,7 +115,8 @@ async def execute_job(
                 # In the claim's transaction, so the attempt has a row exactly when the claim
                 # committed (ADR 0005 decision 5). A row already there for this attempt number is
                 # a bug: its unique violation (23505, class 23) rolls the claim back and the claim
-                # is rejected below; the job stays queued with dispatched_at set (phase 8).
+                # is rejected below; the job stays queued with dispatched_at set until
+                # lost-message recovery publishes it again (ADR 0008 decision 2).
                 await open_attempt(session, job_id, attempt=row.attempts)
             # claim_job cannot tell an unknown job from a lost claim; ADR 0004 answers both with
             # an ack, but an unknown job is worth a warning.

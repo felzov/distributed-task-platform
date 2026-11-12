@@ -1,13 +1,15 @@
 """The dispatcher on real PostgreSQL and RabbitMQ: real publisher, poll loop, process wiring."""
 
 import asyncio
+import logging
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 from aio_pika.abc import AbstractQueue, AbstractRobustConnection
-from sqlalchemy import QueuePool, text
+from sqlalchemy import QueuePool, event, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from task_platform.broker.connection import connect_broker
@@ -16,7 +18,7 @@ from task_platform.broker.topology import declare_jobs_queue
 from task_platform.config import BrokerSettings
 from task_platform.data.db import create_db_engine
 from task_platform.dispatcher import process
-from task_platform.dispatcher.process import poll_forever, run_dispatcher
+from task_platform.dispatcher.process import poll_forever, recover_once, run_dispatcher
 from task_platform.domain.messages import encode_job_message
 from task_platform.services.dispatch import DispatchPoll, dispatch_due_jobs
 from tests.integration.rows import insert_job
@@ -25,6 +27,8 @@ from tests.settings import make_test_broker_settings
 pytestmark = pytest.mark.integration
 
 SENTINEL = "s3cr3t-sentinel-7731"
+# Hours away from now, so the test machine's clock and PostgreSQL's never disagree about them.
+PAST = datetime.now(UTC) - timedelta(hours=3)
 
 
 @pytest.fixture
@@ -39,6 +43,8 @@ def settings(
         jobs_queue_name=broker_settings.jobs_queue_name,
         dispatch_poll_interval_s=0.05,
         publish_timeout_s=1.5,
+        recovery_interval_s=0.05,
+        lost_message_after_s=3600.0,
     )
 
 
@@ -142,6 +148,47 @@ async def test_the_loop_goes_on_after_a_failed_poll(
     assert SENTINEL not in caplog.text
 
 
+# The recovery loop
+
+
+class HangingCount:
+    """The ready count as a broker outage leaves it: the read waits for the connection."""
+
+    async def ready_messages(self) -> int:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+async def test_a_cut_broker_skips_the_lost_message_sweep_and_leases_are_still_recovered(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    settings: BrokerSettings,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The lease sweep needs only the database (ADR 0008 decision 3). A real cut through a proxy
+    # comes with the outage tests; here the read hangs as a robust channel's would.
+    caplog.set_level(logging.INFO)
+    crashed = (await insert_job(engine, status="running", attempts=1, lease_expires_at=PAST))["id"]
+    lost = (await insert_job(engine, dispatched_at=PAST))["id"]
+    short = settings.model_copy(update={"publish_timeout_s": 0.1})
+
+    async with asyncio.timeout(5):
+        await recover_once(sessions, HangingCount(), short)
+
+    async with engine.connect() as connection:
+        rows = await connection.execute(
+            text("SELECT id, status, dispatched_at FROM jobs WHERE id IN (:a, :b)"),
+            {"a": crashed, "b": lost},
+        )
+        state = {row.id: (row.status, row.dispatched_at is None) for row in rows}
+    assert state == {crashed: ("queued", True), lost: ("queued", False)}
+    assert "lease recovery: 1 expired, 1 requeued, 0 failed" in caplog.text
+    assert (
+        "lost-message sweep skipped: the jobs queue's ready count was not read"
+        " (builtins.TimeoutError)"
+    ) in caplog.text
+
+
 # The process
 
 
@@ -174,6 +221,29 @@ async def test_the_dispatcher_declares_the_queue_and_publishes_due_jobs(
     assert await queued_bodies(queue) == [encode_job_message(job_id)]
 
 
+async def test_the_dispatcher_publishes_a_lost_message_again(
+    engine: AsyncEngine,
+    broker_connection: AbstractRobustConnection,
+    settings: BrokerSettings,
+) -> None:
+    # Queued and published hours ago, with nothing in the queue: its message died before a claim.
+    job_id = (await insert_job(engine, dispatched_at=PAST))["id"]
+
+    dispatcher = asyncio.create_task(run_dispatcher(settings))
+    try:
+        async with asyncio.timeout(5):
+            # None in between: cleared, not published yet.
+            while (published := await dispatched_at(engine, job_id)) is None or published <= PAST:
+                await asyncio.sleep(0.02)
+    finally:
+        await stop(dispatcher)
+
+    # Cleared by the recovery loop, then published and marked again by the poll loop: one message.
+    channel = await broker_connection.channel()
+    queue = await channel.declare_queue(settings.jobs_queue_name, passive=True)
+    assert await queued_bodies(queue) == [encode_job_message(job_id)]
+
+
 async def test_cancelling_the_dispatcher_closes_its_connection_and_pool(
     engine: AsyncEngine,
     broker_connection: AbstractRobustConnection,
@@ -183,6 +253,10 @@ async def test_cancelling_the_dispatcher_closes_its_connection_and_pool(
     # Ctrl-C cancels the dispatcher; nothing it opened may outlive it.
     connections: list[AbstractRobustConnection] = []
     engines: list[AsyncEngine] = []
+    # Every database connection the dispatcher's pool opens or closes. Counted by events, not by
+    # the pool after dispose(), which replaces the pool with an empty one: a connection still
+    # checked out at shutdown would never show there.
+    pool_events = {"connect": 0, "close": 0}
 
     async def recording_connect_broker(settings: BrokerSettings) -> AbstractRobustConnection:
         connections.append(await connect_broker(settings))
@@ -190,6 +264,8 @@ async def test_cancelling_the_dispatcher_closes_its_connection_and_pool(
 
     def recording_create_db_engine(settings: BrokerSettings) -> AsyncEngine:
         engines.append(create_db_engine(settings))
+        for name in pool_events:
+            event.listen(engines[-1].sync_engine, name, count_pool_event(pool_events, name))
         return engines[-1]
 
     monkeypatch.setattr(process, "connect_broker", recording_connect_broker)
@@ -198,12 +274,20 @@ async def test_cancelling_the_dispatcher_closes_its_connection_and_pool(
 
     dispatcher = asyncio.create_task(run_dispatcher(settings))
     try:
-        # One poll done, so the pool holds a connection.
+        # One poll done, so the pool holds a connection; the recovery loop may hold a second.
         await wait_until_dispatched(engine, job_id)
-        assert idle_pooled_connections(engines[0]) == 1
+        assert idle_pooled_connections(engines[0]) >= 1
     finally:
         await stop(dispatcher)
 
     assert connections[0].is_closed
-    # Disposed: its pooled connection is closed and the pool is empty.
-    assert idle_pooled_connections(engines[0]) == 0
+    # Every connection it opened is closed: none left checked out, none left in the pool.
+    assert pool_events["connect"] >= 1
+    assert pool_events["close"] == pool_events["connect"]
+
+
+def count_pool_event(counts: dict[str, int], name: str) -> Callable[..., None]:
+    def count(*_: Any) -> None:
+        counts[name] += 1
+
+    return count
