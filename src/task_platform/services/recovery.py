@@ -1,13 +1,21 @@
-"""Lease recovery: jobs whose worker never finished their attempt (ADR 0001 decision 8, ADR 0008).
+"""Recovery sweeps for jobs that would otherwise wait forever (ADR 0008 decisions 1 and 2).
 
-A job stays `running` with its lease expired when its worker crashed, was stopped past its grace
-period, or could not write its final update. Each sweep requeues such jobs while they have
-attempts left, fails them otherwise, and closes the attempt's history row. Logs carry ids,
-attempts and codes, never anything else from the rows.
+Lease recovery (ADR 0001 decision 8): a job stays `running` with its lease expired when its worker
+crashed, was stopped past its grace period, or could not write its final update. Each sweep
+requeues such jobs while they have attempts left, fails them otherwise, and closes the attempt's
+history row.
+
+Lost-message recovery (ADR 0002 decision 7): a job stays `queued` with `dispatched_at` set when its
+message died or was lost before any claim. Each sweep, run only while the jobs queue has no ready
+messages, marks such jobs unpublished again, so the dispatcher publishes them anew.
+
+Logs carry ids, attempts and codes, never anything else from the rows.
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass
+from typing import Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -16,9 +24,11 @@ from task_platform.config import BrokerSettings
 from task_platform.data.attempts import close_attempt
 from task_platform.data.jobs import (
     ExpiredLeaseRow,
+    clear_lost_dispatches,
     fail_expired_lease,
     requeue_expired_lease,
     select_expired_leases,
+    select_lost_message_job_ids,
 )
 from task_platform.domain.failures import FailureCode
 from task_platform.domain.job_status import JobStatus, ensure_transition
@@ -143,3 +153,73 @@ def _decide(row: ExpiredLeaseRow) -> AfterFailure:
             safe_logging.class_name(exc),
         )
         return AfterFailure.FAIL
+
+
+class QueueDepth(Protocol):
+    """Reads the jobs queue's ready messages (broker.queue_depth.ReadyCount)."""
+
+    async def ready_messages(self) -> int: ...
+
+
+@dataclass(frozen=True)
+class LostMessageSweep:
+    """`ready`: the jobs queue's ready messages, None if not read; the sweep runs only at 0.
+
+    `found`: jobs the sweep locked; `cleared`: those it marked unpublished. Both 0 if skipped.
+    """
+
+    ready: int | None
+    found: int
+    cleared: int
+
+
+async def recover_lost_messages(
+    session_factory: async_sessionmaker[AsyncSession],
+    queue: QueueDepth,
+    settings: BrokerSettings,
+) -> LostMessageSweep:
+    """Mark up to `dispatch_batch_size` jobs whose message is overdue unpublished, then COMMIT.
+
+    Only while the jobs queue has no ready messages: then no copy of such a message waits in a
+    backlog, so publishing it again repeats nothing that is only delayed (ADR 0008 decision 2). A
+    count that cannot be read within `publish_timeout_s` skips the sweep; so does a database
+    error, which is raised. Either way, the next pass tries again.
+    """
+    try:
+        # A robust channel waits for its connection during a broker outage: without this bound
+        # one read would hold the recovery loop, the lease sweep included, until the broker is back.
+        async with asyncio.timeout(settings.publish_timeout_s):
+            ready = await queue.ready_messages()
+    # A broker outage, a missing queue or a bug. The class only, as for every broker error.
+    # CancelledError too: aiormq fails a pending request with it when its heartbeat finds the
+    # connection stuck (observed on aiormq 7.2.4), though nothing cancelled this task. Only a
+    # cancellation that was asked for, such as shutdown, ends the sweep.
+    except (Exception, asyncio.CancelledError) as exc:
+        task = asyncio.current_task()
+        if isinstance(exc, asyncio.CancelledError) and task is not None and task.cancelling():
+            raise
+        logger.warning(
+            "lost-message sweep skipped: the jobs queue's ready count was not read (%s)",
+            safe_logging.class_name(exc),
+        )
+        return LostMessageSweep(ready=None, found=0, cleared=0)
+    if ready:
+        logger.info("lost-message sweep skipped: %d messages ready in the jobs queue", ready)
+        return LostMessageSweep(ready=ready, found=0, cleared=0)
+    async with session_factory.begin() as session:
+        found = await select_lost_message_job_ids(
+            session, lost_after_s=settings.lost_message_after_s, limit=settings.dispatch_batch_size
+        )
+        cleared = await clear_lost_dispatches(
+            session, found, lost_after_s=settings.lost_message_after_s
+        )
+    # Only once committed, as for lease recovery. An ERROR: something lost the message or let it
+    # die before its claim (a rejected claim, a dead letter, the broker), and a message that dies
+    # that way every time comes back here once per threshold (ADR 0008 consequences).
+    for job_id in cleared:
+        logger.error(
+            "job %s: no message ready %g s after its publish; marked to be published again",
+            job_id,
+            settings.lost_message_after_s,
+        )
+    return LostMessageSweep(ready=0, found=len(found), cleared=len(cleared))

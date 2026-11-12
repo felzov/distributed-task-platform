@@ -343,3 +343,24 @@ def test_retry_base_must_not_exceed_the_cap(base_s: float, accepted: bool) -> No
     else:
         with pytest.raises(ValidationError, match="retry_base_delay_s must not exceed"):
             broker_settings(**values)
+
+
+@pytest.mark.parametrize(
+    ("threshold_s", "accepted"),
+    [
+        (0.001, True),
+        (86400.0, True),
+        (0, False),
+        (86400.001, False),
+        (float("inf"), False),
+        (float("nan"), False),
+    ],
+)
+def test_lost_message_threshold_bounds(threshold_s: float, accepted: bool) -> None:
+    # ADR 0008 decision 2; the cap also keeps now() - threshold inside PostgreSQL's range.
+    values = {"database_url": URL, "broker_url": BROKER_URL, "lost_message_after_s": threshold_s}
+    if accepted:
+        assert broker_settings(**values).lost_message_after_s == threshold_s
+    else:
+        with pytest.raises(ValidationError, match="lost_message_after_s"):
+            broker_settings(**values)

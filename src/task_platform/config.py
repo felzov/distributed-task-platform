@@ -94,6 +94,10 @@ class BrokerSettings(Settings):
     # bound it; the one-day cap keeps available_at far inside PostgreSQL's timestamp range.
     retry_base_delay_s: float = Field(default=2.0, gt=0)
     retry_max_delay_s: float = Field(default=300.0, gt=0, le=86400)
+    # A queued job published this long ago is published again once the jobs queue has no ready
+    # messages (ADR 0008 decision 2). A placeholder, not measured. The one-day cap keeps
+    # now() - threshold inside PostgreSQL's timestamp range and rejects inf.
+    lost_message_after_s: float = Field(default=600.0, gt=0, le=86400)
 
     @model_validator(mode="after")
     def _publish_timeout_within_statement_timeout(self) -> Self:
