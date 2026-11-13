@@ -17,6 +17,8 @@ class Settings(BaseSettings):
 
     # SecretStr keeps the password out of repr(), logs and tracebacks.
     database_url: SecretStr
+    # Bounds each connection attempt, and in the dispatcher and the worker the database pool's
+    # close at a stop (ADR 0008 decisions 5 and 6).
     db_connect_timeout_s: float = Field(default=5.0, gt=0)
     # Server-side limit per statement, set on every connection.
     db_statement_timeout_ms: int = Field(default=5_000, gt=0)
@@ -61,7 +63,9 @@ class BrokerSettings(Settings):
     """
 
     broker_url: SecretStr
-    # Bounds each connection attempt at start; a failed one is retried (ADR 0008 decision 7).
+    # Bounds each connection attempt at start; a failed one is retried (ADR 0008 decision 7). Also
+    # bounds the connection's close at a stop and the worker's closes of a channel it gives up on
+    # (decisions 5, 6 and 8).
     broker_connect_timeout_s: float = Field(default=5.0, gt=0)
     # Sent in Connection.Tune-Ok, replacing the broker's proposal; missed heartbeats close it.
     # The AMQP field is 16 bits, and aiormq sends 0 (heartbeats off) for 65535 or more.

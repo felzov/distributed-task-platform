@@ -25,6 +25,7 @@ from task_platform.main import create_app
 from task_platform.shutdown import StopSignals
 from task_platform.worker.process import run_worker
 from tests.app_client import app_client
+from tests.integration.processes import child_process
 from tests.integration.rows import fake_notification_rows, insert_job
 from tests.proxy import TcpProxy, running_proxy
 from tests.settings import make_test_broker_settings, make_test_settings
@@ -198,3 +199,155 @@ async def test_during_a_broker_cut_the_lease_sweep_runs_and_the_lost_message_swe
             assert (await job_row(engine, lost_id))["dispatched_at"] is None
         finally:
             await connection.close()
+
+
+# A second signal on a link that stopped passing traffic (ADR 0008 decisions 5 and 6). Without
+# it, an idle worker's consumer cancel waits for an answer that never comes until the heartbeat
+# gives up (60 s by default), the broker connection's close for aio-pika's own 2 s, and the
+# database pool's dispose for the driver's timeouts (about 10 s per pooled connection). All
+# observed on a frozen link.
+
+# The bound on each close on the frozen side: above aio-pika's own 2 s, so a process that exits
+# well within it was stopped by the second signal, not by the bound.
+FROZEN_CLOSE_BOUND_S = "3"
+SECOND_SIGNAL_AFTER_S = 0.2
+
+
+def frozen_env(
+    proxy: TcpProxy, link: str, settings: BrokerSettings, database_url: str, **extra: str
+) -> dict[str, str]:
+    broker_url = settings.broker_url.get_secret_value()
+    return {
+        "DATABASE_URL": proxy.url(database_url) if link == "database" else database_url,
+        "BROKER_URL": proxy.url(broker_url) if link == "broker" else broker_url,
+        "JOBS_QUEUE_NAME": settings.jobs_queue_name,
+        "BROKER_CONNECT_TIMEOUT_S": FROZEN_CLOSE_BOUND_S,
+        "DB_CONNECT_TIMEOUT_S": FROZEN_CLOSE_BOUND_S,
+        # One poll and one recovery pass at start, then nothing until the stop.
+        "DISPATCH_POLL_INTERVAL_S": "3600",
+        "RECOVERY_INTERVAL_S": "3600",
+    } | extra
+
+
+async def stop_twice(child: asyncio.subprocess.Process) -> tuple[int, float]:
+    """SIGTERM, then SIGINT while the first stop waits on the frozen link; returns the exit status
+    and the seconds from the SIGINT to the exit."""
+    child.send_signal(signal.SIGTERM)
+    await asyncio.sleep(SECOND_SIGNAL_AFTER_S)
+    child.send_signal(signal.SIGINT)
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    async with asyncio.timeout(15):
+        status = await child.wait()
+    return status, loop.time() - start
+
+
+def assert_no_stray_errors(stderr: bytes, link: str) -> None:
+    # Not printed on failure: the child's errors could quote its settings.
+    assert b"Task was destroyed" not in stderr
+    assert b"never retrieved" not in stderr
+    if link == "broker":
+        assert b"Traceback" not in stderr
+    else:
+        # SQLAlchemy records the close of a pooled connection that the stop cut short ("Exception
+        # closing connection", a CancelledError in asyncpg's close) with a traceback.
+        assert stderr.count(b"Traceback") == stderr.count(b"Exception closing connection")
+
+
+@pytest.mark.parametrize(
+    ("module", "link", "cut_short"),
+    [
+        ("task_platform.dispatcher", "broker", b"closing the broker connection"),
+        ("task_platform.dispatcher", "database", b"closing the database pool"),
+        ("task_platform.worker", "database", b"closing the database pool"),
+        # The consumer cancel waits on the frozen link, and the second signal cancels it again;
+        # the connection's close that follows ends by itself after aio-pika's 2 s.
+        ("task_platform.worker", "broker", None),
+    ],
+    ids=["dispatcher-broker", "dispatcher-database", "worker-database", "worker-broker"],
+)
+async def test_a_second_signal_stops_an_idle_process_whose_link_froze(
+    engine: AsyncEngine,
+    broker_connection: AbstractRobustConnection,
+    settings: BrokerSettings,
+    test_database_url: str,
+    module: str,
+    link: str,
+    cut_short: bytes | None,
+) -> None:
+    name = settings.jobs_queue_name
+    due_id = (await insert_job(engine))["id"]
+    crashed_id = await insert_crashed(engine)
+    upstream = settings.broker_url.get_secret_value() if link == "broker" else test_database_url
+    async with running_proxy(upstream) as proxy:
+        env = frozen_env(proxy, link, settings, test_database_url)
+        async with child_process(module, env) as (child, stderr):
+            # Idle: past its start-up, its first poll and recovery pass committed, with a pooled
+            # database connection.
+            async with asyncio.timeout(15):
+                if module == "task_platform.worker":
+                    # Its consumer at the broker; the job's message is never published.
+                    while await consumers_or_none(broker_connection, name) != 1:
+                        await asyncio.sleep(0.05)
+                else:
+                    while (await job_row(engine, due_id))["dispatched_at"] is None or (
+                        await job_row(engine, crashed_id)
+                    )["status"] != "queued":
+                        await asyncio.sleep(0.05)
+            await asyncio.sleep(0.5)
+
+            proxy.freeze()
+            status, elapsed = await stop_twice(child)
+
+    assert status == 0
+    if cut_short is None:
+        assert elapsed < float(FROZEN_CLOSE_BOUND_S) + 0.5
+    else:
+        assert cut_short + b" cut short by the second signal" in stderr
+        assert elapsed < 1.5
+    assert_no_stray_errors(bytes(stderr), link)
+
+
+async def test_a_second_signal_stops_a_dispatcher_whose_poll_is_stuck_on_a_frozen_database(
+    engine: AsyncEngine,
+    broker_connection: AbstractRobustConnection,
+    settings: BrokerSettings,
+    test_database_url: str,
+) -> None:
+    due_id = (await insert_job(engine))["id"]
+    async with running_proxy(test_database_url) as proxy:
+        env = frozen_env(
+            proxy,
+            "database",
+            settings,
+            test_database_url,
+            DISPATCH_POLL_INTERVAL_S="0.05",
+            # Once forced, the pool's dispose still gets its bound: its idle connections, left
+            # by the recovery pass, are cut at it.
+            DB_CONNECT_TIMEOUT_S="0.5",
+        )
+        async with child_process("task_platform.dispatcher", env) as (child, stderr):
+            async with asyncio.timeout(15):
+                while (await job_row(engine, due_id))["dispatched_at"] is None:
+                    await asyncio.sleep(0.05)
+            proxy.freeze()
+            # The next poll, 0.05 s later, waits on the frozen link.
+            await asyncio.sleep(0.3)
+            status, elapsed = await stop_twice(child)
+
+    assert status == 0
+    assert b"dispatcher stopped on a second signal: the poll or sweep in hand was cancelled" in (
+        stderr
+    )
+    # SQLAlchemy closes the cancelled poll's connection inside asyncio.shield with a 2 s timeout
+    # (sqlalchemy/connectors/asyncio.py and dialects/postgresql/asyncpg.py, 2.1.6): no cancel cuts
+    # it. Then the dispose's 0.5 s bound (2.6 s in all, observed), and room for a loaded machine.
+    assert elapsed < 4.0
+    assert_no_stray_errors(bytes(stderr), "database")
+
+
+async def consumers_or_none(connection: AbstractRobustConnection, queue: str) -> int | None:
+    try:
+        return await consumers(connection, queue)
+    except Exception:
+        return None

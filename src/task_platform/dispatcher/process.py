@@ -24,6 +24,7 @@ from task_platform.services.recovery import (
 from task_platform.shutdown import (
     Ended,
     StopSignals,
+    clean_up_within,
     finish_unless_forced,
     sleep_unless_stopped,
 )
@@ -152,7 +153,12 @@ async def run_dispatcher(settings: BrokerSettings, signals: StopSignals) -> None
             return
         await _dispatch_until_stopped(engine, connection, settings, signals)
     finally:
-        await engine.dispose()
+        await clean_up_within(
+            "closing the database pool",
+            engine.dispose(),
+            settings.db_connect_timeout_s,
+            signals.force,
+        )
 
 
 async def _dispatch_until_stopped(
@@ -185,7 +191,12 @@ async def _dispatch_until_stopped(
                 " and its cleanup failed"
             )
     finally:
-        await connection.close()
+        await clean_up_within(
+            "closing the broker connection",
+            connection.close(),
+            settings.broker_connect_timeout_s,
+            signals.force,
+        )
 
 
 async def poll_and_recover(

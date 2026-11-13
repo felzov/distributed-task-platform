@@ -19,7 +19,12 @@ from task_platform.config import BrokerSettings
 from task_platform.data.db import create_db_engine
 from task_platform.domain.messages import InvalidMessageError, parse_job_message
 from task_platform.services.execution import Handler, Outcome, execute_job
-from task_platform.shutdown import StopSignals, cancel_and_wait, finish_unless_forced
+from task_platform.shutdown import (
+    StopSignals,
+    cancel_and_wait,
+    clean_up_within,
+    finish_unless_forced,
+)
 from task_platform.startup import wait_for_dependencies
 from task_platform.worker.handlers import HANDLERS
 
@@ -299,7 +304,7 @@ async def consume_until_stopped(
             )
     finally:
         stop_requested.cancel()
-        await cancel_and_wait(consuming)
+        await cancel_and_wait(consuming, signals.force)
 
 
 async def _finish(consumer: _Consumer, consuming: asyncio.Task[None]) -> None:
@@ -360,6 +365,16 @@ async def run_worker(settings: BrokerSettings, signals: StopSignals) -> None:
                 signals,
             )
         finally:
-            await connection.close()
+            await clean_up_within(
+                "closing the broker connection",
+                connection.close(),
+                settings.broker_connect_timeout_s,
+                signals.force,
+            )
     finally:
-        await engine.dispose()
+        await clean_up_within(
+            "closing the database pool",
+            engine.dispose(),
+            settings.db_connect_timeout_s,
+            signals.force,
+        )
