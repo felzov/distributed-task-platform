@@ -4,11 +4,13 @@
 """
 
 import asyncio
+import contextlib
 import logging
-from collections.abc import Awaitable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Final, Protocol
 
 from aio_pika.abc import AbstractConnection, AbstractQueue, AbstractQueueIterator
+from aiormq.exceptions import ChannelAccessRefused, ChannelPreconditionFailed
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from task_platform import safe_logging
@@ -88,17 +90,30 @@ async def _settle(action: str, answer: Awaitable[None]) -> None:
         logger.warning("could not %s a job message: %s", action, safe_logging.class_name(exc))
 
 
+def _cancellation_requested() -> bool:
+    # aiormq fails a pending request with CancelledError when its heartbeat finds the connection
+    # stuck (observed on aiormq 7.2.4), though nothing cancelled this task.
+    task = asyncio.current_task()
+    return task is None or task.cancelling() > 0
+
+
+# Opens a channel of its own with the jobs queue: `open_jobs_queue` on the worker's connection.
+OpenQueue = Callable[[], Awaitable[AbstractQueue]]
+
+
 class _Consumer:
     """Handles the queue's messages one at a time and knows whether it holds one."""
 
     def __init__(
         self,
         queue: AbstractQueue,
+        reopen: OpenQueue,
         session_factory: async_sessionmaker[AsyncSession],
         handlers: Mapping[str, Handler],
         settings: BrokerSettings,
     ) -> None:
         self._queue = queue
+        self._reopen = reopen
         self._session_factory = session_factory
         self._handlers = handlers
         self._settings = settings
@@ -109,12 +124,42 @@ class _Consumer:
         self._stopping = False
 
     async def run(self) -> None:
-        """Consume until `stop` was called and the held message is answered."""
+        """Consume until `stop` was called and the held message is answered. An iterator that
+        ends otherwise is replaced by a new consumer on a new channel (ADR 0008 decision 8)."""
         # aio-pika 10.2.1's robust iterator consumed again after the broker cancelled the consumer
         # (queue deleted, tested) and after an 87 s broker outage (observed once, 2026-11-02). It
-        # can still end: its source gives up after 60 s without a restored channel in one path,
-        # and it ends when the connection is closed.
-        async with self._queue.iterator() as messages:
+        # can still end: its source gives up after 60 s without a restored channel in one path.
+        queue = self._queue
+        while True:
+            ended = await self._consume_until_it_ends(queue)
+            if self._stopping:
+                return
+            logger.warning(
+                "the jobs queue consumer %s; consuming again in %g s",
+                ended,
+                self._settings.startup_retry_interval_s,
+            )
+            queue = await self._consume_again(queue)
+
+    async def _consume_until_it_ends(self, queue: AbstractQueue) -> str:
+        """How the consumer ended: its iterator ended, or the broker failed it."""
+        try:
+            await self._consume(queue)
+        # handle_message never raises, so this is the broker's: a basic.consume on a channel
+        # closed meanwhile, during the outage decision 8 is for. The class only. Not while this
+        # task is being cancelled: then it is the cleanup's error, and the cancellation goes on.
+        except Exception as exc:
+            if _cancellation_requested():
+                raise
+            return f"failed ({safe_logging.class_name(exc)})"
+        except asyncio.CancelledError:
+            if _cancellation_requested():
+                raise
+            return "failed (a cancellation nobody asked for)"
+        return "ended"
+
+    async def _consume(self, queue: AbstractQueue) -> None:
+        async with queue.iterator() as messages:
             self._messages = messages
             async for message in messages:
                 self.holding = True
@@ -129,11 +174,53 @@ class _Consumer:
                 # of the cancel, the next message may already be on its way here.
                 if self._stopping:
                     return
-        if not self._stopping:
-            # Then the process stops instead of idling with no consumer; no message or job is
-            # lost (the broker requeues, the claim fences). Consuming again comes with the outage
-            # handling (ADR 0008 decision 8).
-            raise RuntimeError("the jobs queue iterator ended; the worker stops")
+
+    async def _consume_again(self, old: AbstractQueue) -> AbstractQueue:
+        """The jobs queue on a new channel, after the retry interval; tried until it opens."""
+        interval = self._settings.startup_retry_interval_s
+        await asyncio.sleep(interval)
+        # Not the old channel: aio-pika restores the consumers it still has on record when a
+        # channel comes back, with the old iterator's callback (source, aio-pika 10.2.1). Bounded:
+        # on a link that stopped passing traffic, a close waits for an answer that never comes.
+        try:
+            async with asyncio.timeout(self._settings.broker_connect_timeout_s):
+                await old.channel.close()
+        # Gone with the connection, already closed, or not answered: nothing is held on it.
+        except Exception as exc:
+            logger.warning(
+                "could not close the old jobs queue channel: %s", safe_logging.class_name(exc)
+            )
+        except asyncio.CancelledError:
+            if _cancellation_requested():
+                raise
+            logger.warning(
+                "could not close the old jobs queue channel: a cancellation nobody asked for"
+            )
+        while True:
+            try:
+                return await self._reopen()
+            # The queue's arguments or the user's permissions changed: no retry fixes that, and
+            # the same error stops the worker at start.
+            except (ChannelPreconditionFailed, ChannelAccessRefused) as exc:
+                logger.error(
+                    "the jobs queue cannot be opened again: %s; the worker stops",
+                    safe_logging.class_name(exc),
+                )
+                raise
+            # A broker outage; the robust connection reconnects meanwhile. The class only, as for
+            # every broker error.
+            except Exception as exc:
+                if _cancellation_requested():
+                    raise
+                reason = safe_logging.class_name(exc)
+            except asyncio.CancelledError:
+                if _cancellation_requested():
+                    raise
+                reason = "a cancellation nobody asked for"
+            logger.warning(
+                "could not open the jobs queue again: %s; retrying in %g s", reason, interval
+            )
+            await asyncio.sleep(interval)
 
     def stop(self) -> None:
         """Take no message after the one in hand. Called in the same step that saw it held, so
@@ -160,6 +247,7 @@ class _Consumer:
 
 async def consume_until_stopped(
     queue: AbstractQueue,
+    reopen: OpenQueue,
     session_factory: async_sessionmaker[AsyncSession],
     handlers: Mapping[str, Handler],
     settings: BrokerSettings,
@@ -171,19 +259,23 @@ async def consume_until_stopped(
     let the held one finish (handler, final update, answer) for up to `shutdown_grace_s`. Past
     that, or on a second signal, its handler is cancelled: the message goes back to the queue when
     the connection closes, and lease recovery takes the job on.
+
+    An iterator that ends without a stop is replaced: `reopen` opens the jobs queue on a new
+    channel (ADR 0008 decision 8).
     """
     if signals.stop.is_set():
         # A signal during start-up. Not subscribing at all: a subscribe cancelled midway leaves a
         # consumer nobody cancels, whose message comes back only with the connection, counted.
         logger.info("worker stopping: stopped before consuming")
         return
-    consumer = _Consumer(queue, session_factory, handlers, settings)
+    consumer = _Consumer(queue, reopen, session_factory, handlers, settings)
     consuming = asyncio.create_task(consumer.run())
     stop_requested = asyncio.create_task(signals.stop.wait())
     try:
         await asyncio.wait({consuming, stop_requested}, return_when=asyncio.FIRST_COMPLETED)
         if consuming.done():
-            # The iterator ended without a stop: raises.
+            # It returns only on a stop, so it raised: a bug, or a jobs queue that cannot be
+            # opened again (logged).
             consuming.result()
             return
         if not consumer.holding:
@@ -230,8 +322,17 @@ async def open_jobs_queue(
     """A channel of its own with prefetch 1, and the jobs queue declared on it."""
     # Robust on a robust connection: the prefetch and the queue are restored with the channel.
     channel = await connection.channel()
-    await channel.set_qos(prefetch_count=PREFETCH_COUNT)
-    return await declare_jobs_queue(channel, settings.jobs_queue_name)
+    try:
+        await channel.set_qos(prefetch_count=PREFETCH_COUNT)
+        return await declare_jobs_queue(channel, settings.jobs_queue_name)
+    except Exception:
+        # Closed by the broker, a robust channel reopens itself (observed, see ReadyCount):
+        # without this, every failed attempt to consume again would leave one more open. A close
+        # that fails too adds nothing to the error raised.
+        with contextlib.suppress(Exception):
+            async with asyncio.timeout(settings.broker_connect_timeout_s):
+                await channel.close()
+        raise
 
 
 async def run_worker(settings: BrokerSettings, signals: StopSignals) -> None:
@@ -250,7 +351,14 @@ async def run_worker(settings: BrokerSettings, signals: StopSignals) -> None:
             queue = await open_jobs_queue(connection, settings)
             logger.info("worker started: queue %s", settings.jobs_queue_name)
             sessions = async_sessionmaker(engine, expire_on_commit=False)
-            await consume_until_stopped(queue, sessions, HANDLERS, settings, signals)
+            await consume_until_stopped(
+                queue,
+                lambda: open_jobs_queue(connection, settings),
+                sessions,
+                HANDLERS,
+                settings,
+                signals,
+            )
         finally:
             await connection.close()
     finally:

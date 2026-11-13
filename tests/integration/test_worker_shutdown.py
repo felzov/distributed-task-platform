@@ -148,7 +148,14 @@ async def test_a_stop_signal_lets_the_job_in_hand_finish_and_takes_no_new_messag
     async with worker_connection(settings) as connection:
         queue = await open_jobs_queue(connection, settings)
         worker = asyncio.create_task(
-            consume_until_stopped(queue, sessions, handler.handlers(), settings, signals)
+            consume_until_stopped(
+                queue,
+                lambda: open_jobs_queue(connection, settings),
+                sessions,
+                handler.handlers(),
+                settings,
+                signals,
+            )
         )
         async with asyncio.timeout(5):
             await handler.started.wait()
@@ -197,7 +204,14 @@ async def test_a_job_not_finished_in_time_is_cancelled_and_left_for_recovery(
     async with worker_connection(settings) as connection:
         queue = await open_jobs_queue(connection, grace)
         worker = asyncio.create_task(
-            consume_until_stopped(queue, sessions, handler.handlers(), grace, signals)
+            consume_until_stopped(
+                queue,
+                lambda: open_jobs_queue(connection, grace),
+                sessions,
+                handler.handlers(),
+                grace,
+                signals,
+            )
         )
         async with asyncio.timeout(5):
             await handler.started.wait()
@@ -231,7 +245,14 @@ async def test_an_idle_worker_stops_at_once_and_cancels_its_consumer(
     async with worker_connection(settings) as connection:
         queue = await open_jobs_queue(connection, settings)
         worker = asyncio.create_task(
-            consume_until_stopped(queue, sessions, GatedHandler().handlers(), settings, signals)
+            consume_until_stopped(
+                queue,
+                lambda: open_jobs_queue(connection, settings),
+                sessions,
+                GatedHandler().handlers(),
+                settings,
+                signals,
+            )
         )
         await wait_for_counts(broker_connection, settings.jobs_queue_name, (0, 1))
 
@@ -262,7 +283,14 @@ async def test_a_stop_before_consuming_starts_leaves_the_queue_untouched(
     async with worker_connection(settings) as connection:
         queue = await open_jobs_queue(connection, settings)
         async with asyncio.timeout(1):
-            await consume_until_stopped(queue, sessions, handler.handlers(), settings, signals)
+            await consume_until_stopped(
+                queue,
+                lambda: open_jobs_queue(connection, settings),
+                sessions,
+                handler.handlers(),
+                settings,
+                signals,
+            )
     assert not handler.started.is_set()
 
     await wait_for_counts(broker_connection, name, (1, 0))

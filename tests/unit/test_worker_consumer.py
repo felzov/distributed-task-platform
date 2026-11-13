@@ -1,21 +1,25 @@
-"""The worker's consumer without a broker: an iterator that ends by itself stops the worker, and a
-stop's races with the job in hand and with the consumer's cancel (ADR 0008 decision 5)."""
+"""The worker's consumer without a broker: an iterator that ends by itself is replaced by a new
+consumer (ADR 0008 decision 8), and a stop's races with the job in hand and with the consumer's
+cancel (ADR 0008 decision 5)."""
 
 import asyncio
 import gc
 import logging
 import signal
+from collections.abc import Awaitable, Callable
+from itertools import pairwise
 from types import TracebackType
 from typing import Any, cast
 
 import pytest
-from aio_pika.abc import AbstractQueue
+from aio_pika.abc import AbstractConnection, AbstractQueue
+from aiormq.exceptions import ChannelPreconditionFailed
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from task_platform.config import BrokerSettings
 from task_platform.shutdown import StopSignals
 from task_platform.worker import process
-from task_platform.worker.process import consume_until_stopped
+from task_platform.worker.process import OpenQueue, consume_until_stopped, open_jobs_queue
 from tests.settings import (
     UNREACHABLE_BROKER_URL,
     UNREACHABLE_DATABASE_URL,
@@ -44,22 +48,6 @@ class EndedIterator:
 
     async def __anext__(self) -> Any:
         raise StopAsyncIteration
-
-
-class EndedQueue:
-    def iterator(self) -> EndedIterator:
-        return EndedIterator()
-
-
-async def test_an_iterator_that_ends_without_a_stop_stops_the_worker() -> None:
-    # Instead of idling with no consumer, until it consumes again (ADR 0008 decision 8).
-    settings = make_test_broker_settings(UNREACHABLE_DATABASE_URL, UNREACHABLE_BROKER_URL)
-    sessions = cast(async_sessionmaker[AsyncSession], None)
-
-    with pytest.raises(RuntimeError, match="the jobs queue iterator ended"):
-        await consume_until_stopped(
-            cast(AbstractQueue, EndedQueue()), sessions, {}, settings, StopSignals()
-        )
 
 
 class FakeIterator:
@@ -103,12 +91,48 @@ class FakeIterator:
         self.closed.set()
 
 
-class FakeQueue:
-    def __init__(self, iterator: FakeIterator) -> None:
-        self._iterator = iterator
+class FailingIterator(EndedIterator):
+    """A consumer the broker failed: its basic.consume (`__aenter__`) or a delivery raises."""
 
-    def iterator(self) -> FakeIterator:
+    def __init__(self, error: BaseException, *, on_enter: bool) -> None:
+        self.error = error
+        self.on_enter = on_enter
+
+    async def __aenter__(self) -> "FailingIterator":
+        if self.on_enter:
+            raise self.error
+        return self
+
+    async def __anext__(self) -> Any:
+        raise self.error
+
+
+class FakeChannel:
+    def __init__(self, close_error: BaseException | None = None, close_s: float = 0.0) -> None:
+        self.closed = False
+        self.close_error = close_error
+        self.close_s = close_s
+
+    async def close(self) -> None:
+        await asyncio.sleep(self.close_s)
+        if self.close_error is not None:
+            raise self.close_error
+        self.closed = True
+
+
+class FakeQueue:
+    def __init__(
+        self, iterator: FakeIterator | EndedIterator, channel: FakeChannel | None = None
+    ) -> None:
+        self._iterator = iterator
+        self.channel = channel or FakeChannel()
+
+    def iterator(self) -> FakeIterator | EndedIterator:
         return self._iterator
+
+
+async def never_reopened() -> AbstractQueue:
+    raise AssertionError("the queue was opened again")
 
 
 def handled_messages(monkeypatch: pytest.MonkeyPatch, job_s: float) -> list[str]:
@@ -123,16 +147,325 @@ def handled_messages(monkeypatch: pytest.MonkeyPatch, job_s: float) -> list[str]
     return handled
 
 
-def grace(seconds: float) -> BrokerSettings:
+def grace(seconds: float, **overrides: object) -> BrokerSettings:
     return make_test_broker_settings(
-        UNREACHABLE_DATABASE_URL, UNREACHABLE_BROKER_URL, shutdown_grace_s=seconds
+        UNREACHABLE_DATABASE_URL, UNREACHABLE_BROKER_URL, shutdown_grace_s=seconds, **overrides
     )
 
 
-def start(iterator: FakeIterator, settings: BrokerSettings, signals: StopSignals) -> Any:
-    queue = cast(AbstractQueue, FakeQueue(iterator))
+def start(
+    iterator: FakeIterator | EndedIterator,
+    settings: BrokerSettings,
+    signals: StopSignals,
+    reopen: Callable[[], Awaitable[AbstractQueue]] = never_reopened,
+) -> Any:
+    return start_on(FakeQueue(iterator), settings, signals, reopen)
+
+
+def start_on(
+    queue: FakeQueue,
+    settings: BrokerSettings,
+    signals: StopSignals,
+    reopen: Callable[[], Awaitable[AbstractQueue]],
+) -> Any:
     sessions = cast(async_sessionmaker[AsyncSession], None)
-    return asyncio.create_task(consume_until_stopped(queue, sessions, {}, settings, signals))
+    return asyncio.create_task(
+        consume_until_stopped(cast(AbstractQueue, queue), reopen, sessions, {}, settings, signals)
+    )
+
+
+# An iterator that ends without a stop
+
+
+async def test_an_iterator_that_ends_without_a_stop_is_replaced_on_a_new_channel(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    handled = handled_messages(monkeypatch, job_s=0)
+    old = FakeQueue(EndedIterator())
+    new_iterator = FakeIterator()
+    opened: list[FakeQueue] = []
+
+    async def reopen() -> AbstractQueue:
+        # The old channel is closed first: aio-pika would restore its consumer with it.
+        assert old.channel.closed
+        opened.append(FakeQueue(new_iterator))
+        return cast(AbstractQueue, opened[-1])
+
+    signals = StopSignals()
+    worker = start_on(old, grace(1.0, startup_retry_interval_s=0.01), signals, reopen)
+    await new_iterator.messages.put("after")
+    async with asyncio.timeout(1):
+        while handled != ["after"]:
+            await asyncio.sleep(0.01)
+
+    signals.received(signal.SIGTERM)
+    async with asyncio.timeout(1):
+        await worker
+    assert len(opened) == 1
+    assert "the jobs queue consumer ended; consuming again in 0.01 s" in caplog.text
+
+
+async def test_a_jobs_queue_that_cannot_be_opened_again_is_retried(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    handled = handled_messages(monkeypatch, job_s=0)
+    new_iterator = FakeIterator()
+    attempts = 0
+
+    async def reopen() -> AbstractQueue:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise ConnectionError(f"broker gone {SENTINEL}")
+        return cast(AbstractQueue, FakeQueue(new_iterator))
+
+    signals = StopSignals()
+    worker = start(EndedIterator(), grace(1.0, startup_retry_interval_s=0.01), signals, reopen)
+    await new_iterator.messages.put("after")
+    async with asyncio.timeout(1):
+        while handled != ["after"]:
+            await asyncio.sleep(0.01)
+
+    signals.received(signal.SIGTERM)
+    async with asyncio.timeout(1):
+        await worker
+    assert attempts == 3
+    assert (
+        caplog.text.count(
+            "could not open the jobs queue again: builtins.ConnectionError; retrying in 0.01 s"
+        )
+        == 2
+    )
+    assert SENTINEL not in caplog.text
+
+
+async def test_a_stop_while_waiting_to_consume_again_stops_at_once() -> None:
+    signals = StopSignals()
+    worker = start(EndedIterator(), grace(1.0, startup_retry_interval_s=1000), signals)
+    await asyncio.sleep(0.05)
+    assert not worker.done()
+
+    signals.received(signal.SIGTERM)
+    async with asyncio.timeout(1):
+        await worker
+
+
+def reopening(*iterators: FakeIterator | EndedIterator) -> tuple[OpenQueue, list[FakeQueue]]:
+    """A reopen that returns a queue with each iterator in turn; the list holds those opened."""
+    opened: list[FakeQueue] = []
+    pending = list(iterators)
+
+    async def reopen() -> AbstractQueue:
+        opened.append(FakeQueue(pending.pop(0)))
+        return cast(AbstractQueue, opened[-1])
+
+    return reopen, opened
+
+
+async def handle_then_stop(
+    worker: Any, signals: StopSignals, iterator: FakeIterator, handled: list[str]
+) -> None:
+    """Deliver one message on `iterator`, wait until it is handled, then stop the worker."""
+    await iterator.messages.put("after")
+    async with asyncio.timeout(1):
+        while handled != ["after"]:
+            await asyncio.sleep(0.01)
+    signals.received(signal.SIGTERM)
+    async with asyncio.timeout(1):
+        await worker
+
+
+@pytest.mark.parametrize(
+    ("error", "on_enter", "reason"),
+    [
+        (ConnectionError(SENTINEL), True, "failed (builtins.ConnectionError)"),
+        (ConnectionError(SENTINEL), False, "failed (builtins.ConnectionError)"),
+        (asyncio.CancelledError(), False, "failed (a cancellation nobody asked for)"),
+    ],
+    ids=["basic.consume fails", "a delivery fails", "an unrequested cancellation"],
+)
+async def test_a_consumer_the_broker_failed_is_replaced(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error: BaseException,
+    on_enter: bool,
+    reason: str,
+) -> None:
+    # During an outage, a basic.consume on a channel closed meanwhile raises, and aiormq fails a
+    # pending request with a CancelledError nobody asked for: neither may end the worker.
+    handled = handled_messages(monkeypatch, job_s=0)
+    new_iterator = FakeIterator()
+    reopen, opened = reopening(new_iterator)
+    signals = StopSignals()
+    failing = FailingIterator(error, on_enter=on_enter)
+    worker = start(failing, grace(1.0, startup_retry_interval_s=0.01), signals, reopen)
+
+    await handle_then_stop(worker, signals, new_iterator, handled)
+    assert len(opened) == 1
+    assert f"the jobs queue consumer {reason}; consuming again in 0.01 s" in caplog.text
+    assert SENTINEL not in caplog.text
+
+
+async def test_a_consumer_is_replaced_as_often_as_it_ends(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    handled = handled_messages(monkeypatch, job_s=0)
+    first = FakeQueue(EndedIterator())
+    last_iterator = FakeIterator()
+    replacements = [FakeQueue(EndedIterator()), FakeQueue(last_iterator)]
+    opened: list[FakeQueue] = []
+
+    async def reopen() -> AbstractQueue:
+        # Every channel given up on is closed before the next one opens.
+        assert all(queue.channel.closed for queue in [first, *opened])
+        opened.append(replacements.pop(0))
+        return cast(AbstractQueue, opened[-1])
+
+    signals = StopSignals()
+    worker = start_on(first, grace(1.0, startup_retry_interval_s=0.01), signals, reopen)
+
+    await handle_then_stop(worker, signals, last_iterator, handled)
+    assert len(opened) == 2
+    assert caplog.text.count("the jobs queue consumer ended; consuming again") == 2
+
+
+@pytest.mark.parametrize(
+    ("channel", "reason"),
+    [
+        (FakeChannel(close_error=ConnectionError(SENTINEL)), "builtins.ConnectionError"),
+        (FakeChannel(close_s=1000), "builtins.TimeoutError"),
+        # aiormq's, on a stuck link, though nothing cancelled the worker.
+        (FakeChannel(close_error=asyncio.CancelledError()), "a cancellation nobody asked for"),
+    ],
+    ids=["close fails", "close not answered", "close fails with a cancellation"],
+)
+async def test_an_old_channel_that_does_not_close_does_not_stop_the_new_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    channel: FakeChannel,
+    reason: str,
+) -> None:
+    handled = handled_messages(monkeypatch, job_s=0)
+    new_iterator = FakeIterator()
+    reopen, opened = reopening(new_iterator)
+    signals = StopSignals()
+    settings = grace(1.0, startup_retry_interval_s=0.01, broker_connect_timeout_s=0.05)
+    worker = start_on(FakeQueue(EndedIterator(), channel), settings, signals, reopen)
+
+    await handle_then_stop(worker, signals, new_iterator, handled)
+    assert len(opened) == 1
+    assert f"could not close the old jobs queue channel: {reason}" in caplog.text
+    assert SENTINEL not in caplog.text
+
+
+async def test_an_unrequested_cancellation_while_opening_again_is_retried(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    handled = handled_messages(monkeypatch, job_s=0)
+    new_iterator = FakeIterator()
+    attempts = 0
+
+    async def reopen() -> AbstractQueue:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise asyncio.CancelledError
+        return cast(AbstractQueue, FakeQueue(new_iterator))
+
+    signals = StopSignals()
+    worker = start(EndedIterator(), grace(1.0, startup_retry_interval_s=0.01), signals, reopen)
+
+    await handle_then_stop(worker, signals, new_iterator, handled)
+    assert attempts == 2
+    assert (
+        "could not open the jobs queue again: a cancellation nobody asked for; retrying in 0.01 s"
+    ) in caplog.text
+
+
+async def test_a_jobs_queue_whose_declaration_is_refused_stops_the_worker(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Its arguments changed (or the user's permissions): no retry fixes that.
+    attempts = 0
+
+    async def reopen() -> AbstractQueue:
+        nonlocal attempts
+        attempts += 1
+        raise ChannelPreconditionFailed(SENTINEL)
+
+    signals = StopSignals()
+    worker = start(EndedIterator(), grace(1.0, startup_retry_interval_s=0.01), signals, reopen)
+    with pytest.raises(ChannelPreconditionFailed):
+        async with asyncio.timeout(1):
+            await worker
+    assert attempts == 1
+    assert (
+        "the jobs queue cannot be opened again: aiormq.exceptions.ChannelPreconditionFailed;"
+        " the worker stops"
+    ) in caplog.text
+    assert "retrying" not in caplog.text
+    assert SENTINEL not in caplog.text
+
+
+async def test_attempts_to_consume_again_are_paced_by_the_retry_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Without the pause, a broker that keeps failing the consumer would get a hot loop.
+    handled = handled_messages(monkeypatch, job_s=0)
+    interval = 0.05
+    loop = asyncio.get_running_loop()
+    new_iterator = FakeIterator()
+    tries: list[float] = []
+
+    async def reopen() -> AbstractQueue:
+        tries.append(loop.time())
+        if len(tries) < 3:
+            raise ConnectionError("broker gone")
+        return cast(AbstractQueue, FakeQueue(new_iterator))
+
+    signals = StopSignals()
+    started = loop.time()
+    worker = start(EndedIterator(), grace(1.0, startup_retry_interval_s=interval), signals, reopen)
+
+    await handle_then_stop(worker, signals, new_iterator, handled)
+    gaps = [b - a for a, b in pairwise([started, *tries])]
+    assert len(gaps) == 3
+    assert min(gaps) >= interval - 0.005, gaps
+
+
+class DeclareRefusedChannel:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def set_qos(self, prefetch_count: int) -> None:
+        return None
+
+    async def declare_queue(self, *_: object, **__: object) -> None:
+        raise ChannelPreconditionFailed(SENTINEL)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class OneChannelConnection:
+    def __init__(self, channel: DeclareRefusedChannel) -> None:
+        self._channel = channel
+
+    async def channel(self) -> DeclareRefusedChannel:
+        return self._channel
+
+
+async def test_opening_the_jobs_queue_closes_its_channel_when_the_declaration_fails() -> None:
+    # A robust channel the broker closed reopens itself: left open, each failed attempt to
+    # consume again would add one more.
+    channel = DeclareRefusedChannel()
+    connection = cast(AbstractConnection, OneChannelConnection(channel))
+    with pytest.raises(ChannelPreconditionFailed):
+        await open_jobs_queue(connection, grace(1.0))
+    assert channel.closed
+
+
+# A stop with a job in hand
 
 
 async def test_a_job_ending_as_the_stop_comes_takes_no_message_delivered_meanwhile(

@@ -180,7 +180,14 @@ async def worker(
     gives the broker back any message the worker had not answered."""
     queue = await open_jobs_queue(connection, settings)
     task = asyncio.create_task(
-        consume_until_stopped(queue, sessions, HANDLERS, settings, StopSignals())
+        consume_until_stopped(
+            queue,
+            lambda: open_jobs_queue(connection, settings),
+            sessions,
+            HANDLERS,
+            settings,
+            StopSignals(),
+        )
     )
     try:
         yield
