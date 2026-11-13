@@ -8,7 +8,7 @@ import signal
 
 import pytest
 
-from task_platform.shutdown import Ended, StopSignals, finish_unless_forced
+from task_platform.shutdown import Ended, StopSignals, finish_unless_forced, sleep_unless_stopped
 
 
 def test_the_first_signal_asks_to_stop_the_second_to_stop_now_and_more_are_ignored(
@@ -125,3 +125,12 @@ async def test_work_whose_cleanup_fails_is_reported_by_class_only(
     assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
         (logging.WARNING, "cleanup after a stop failed: builtins.OSError (sqlstate None)")
     ]
+
+
+async def test_a_stop_ends_the_sleep_at_once() -> None:
+    stop = asyncio.Event()
+    sleeping = asyncio.create_task(sleep_unless_stopped(1000, stop))
+    await asyncio.sleep(0.01)
+    stop.set()
+    async with asyncio.timeout(1):
+        await sleeping

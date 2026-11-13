@@ -291,7 +291,7 @@ async def test_the_worker_process_exits_with_status_0_on_a_signal(
         "JOBS_QUEUE_NAME": settings.jobs_queue_name,
     }
 
-    async def consuming() -> bool:
+    async def consuming(stderr: bytes) -> bool:
         # The queue exists and has the worker's consumer.
         try:
             return await queue_counts(broker_connection, settings.jobs_queue_name) == (0, 1)

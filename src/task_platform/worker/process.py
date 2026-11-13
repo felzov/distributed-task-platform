@@ -12,13 +12,13 @@ from aio_pika.abc import AbstractConnection, AbstractQueue, AbstractQueueIterato
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from task_platform import safe_logging
-from task_platform.broker.connection import connect_broker
 from task_platform.broker.topology import declare_jobs_queue
 from task_platform.config import BrokerSettings
 from task_platform.data.db import create_db_engine
 from task_platform.domain.messages import InvalidMessageError, parse_job_message
 from task_platform.services.execution import Handler, Outcome, execute_job
 from task_platform.shutdown import StopSignals, cancel_and_wait, finish_unless_forced
+from task_platform.startup import wait_for_dependencies
 from task_platform.worker.handlers import HANDLERS
 
 logger = logging.getLogger(__name__)
@@ -235,17 +235,23 @@ async def open_jobs_queue(
 
 
 async def run_worker(settings: BrokerSettings, signals: StopSignals) -> None:
-    """Consume until a stop signal or cancellation. Fails at start if the broker or the queue
-    declaration does."""
-    # As in the dispatcher: creating the engine does no I/O, so a database outage only fails
-    # claims, which back off.
+    """Wait for the database and the broker, then consume until a stop signal or cancellation.
+
+    Raises StartupError on a configuration error at start (ADR 0008 decision 7); fails if the
+    queue declaration does.
+    """
     engine = create_db_engine(settings)
-    connection = await connect_broker(settings)
     try:
-        queue = await open_jobs_queue(connection, settings)
-        logger.info("worker started: queue %s", settings.jobs_queue_name)
-        sessions = async_sessionmaker(engine, expire_on_commit=False)
-        await consume_until_stopped(queue, sessions, HANDLERS, settings, signals)
+        connection = await wait_for_dependencies(engine, settings, signals.stop)
+        if connection is None:
+            logger.info("worker stopped during start-up")
+            return
+        try:
+            queue = await open_jobs_queue(connection, settings)
+            logger.info("worker started: queue %s", settings.jobs_queue_name)
+            sessions = async_sessionmaker(engine, expire_on_commit=False)
+            await consume_until_stopped(queue, sessions, HANDLERS, settings, signals)
+        finally:
+            await connection.close()
     finally:
         await engine.dispose()
-        await connection.close()

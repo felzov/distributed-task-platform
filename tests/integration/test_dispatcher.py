@@ -13,6 +13,7 @@ from aio_pika.abc import AbstractQueue, AbstractRobustConnection
 from sqlalchemy import QueuePool, event, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from task_platform import startup
 from task_platform.broker.connection import connect_broker
 from task_platform.broker.publisher import JobPublisher, open_job_publisher
 from task_platform.broker.topology import declare_jobs_queue
@@ -271,7 +272,7 @@ async def test_cancelling_the_dispatcher_closes_its_connection_and_pool(
             event.listen(engines[-1].sync_engine, name, count_pool_event(pool_events, name))
         return engines[-1]
 
-    monkeypatch.setattr(process, "connect_broker", recording_connect_broker)
+    monkeypatch.setattr(startup, "connect_broker", recording_connect_broker)
     monkeypatch.setattr(process, "create_db_engine", recording_create_db_engine)
     job_id = (await insert_job(engine))["id"]
 
@@ -445,7 +446,7 @@ async def test_the_dispatcher_process_exits_with_status_0_on_a_signal(
         "JOBS_QUEUE_NAME": settings.jobs_queue_name,
     }
 
-    async def polling() -> bool:
+    async def polling(stderr: bytes) -> bool:
         return await dispatched_at(engine, job_id) is not None
 
     status, stderr = await stop_with_signal("task_platform.dispatcher", env, polling, signum)

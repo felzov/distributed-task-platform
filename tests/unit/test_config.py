@@ -400,3 +400,23 @@ def test_shutdown_grace_bounds(grace_s: float, accepted: bool) -> None:
     else:
         with pytest.raises(ValidationError, match="shutdown_grace_s"):
             broker_settings(**values)
+
+
+@pytest.mark.parametrize(
+    ("interval_s", "accepted"),
+    [
+        (0.001, True),
+        (3600.0, True),
+        (0, False),
+        (3600.1, False),
+        (float("inf"), False),
+        (float("nan"), False),
+    ],
+)
+def test_startup_retry_interval_bounds(interval_s: float, accepted: bool) -> None:
+    values = {"database_url": URL, "broker_url": BROKER_URL, "startup_retry_interval_s": interval_s}
+    if accepted:
+        assert broker_settings(**values).startup_retry_interval_s == interval_s
+    else:
+        with pytest.raises(ValidationError, match="startup_retry_interval_s"):
+            broker_settings(**values)

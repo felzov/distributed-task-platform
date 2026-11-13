@@ -4,6 +4,7 @@ delivery, a database outage, a deleted queue and the process wiring (ADR 0004 de
 import asyncio
 import json
 import logging
+import signal
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -15,6 +16,7 @@ from aio_pika.abc import AbstractIncomingMessage, AbstractRobustConnection
 from sqlalchemy import QueuePool, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from task_platform import startup
 from task_platform.broker.connection import connect_broker
 from task_platform.broker.topology import dead_letter_queue_name, declare_jobs_queue
 from task_platform.config import BrokerSettings
@@ -463,7 +465,7 @@ async def test_the_worker_process_declares_the_queue_runs_jobs_and_cleans_up(
         engines.append(create_db_engine(settings))
         return engines[-1]
 
-    monkeypatch.setattr(process, "connect_broker", recording_connect_broker)
+    monkeypatch.setattr(startup, "connect_broker", recording_connect_broker)
     monkeypatch.setattr(process, "create_db_engine", recording_create_db_engine)
     job_id = await insert_due_job(engine)
 
@@ -487,8 +489,22 @@ async def test_the_worker_process_declares_the_queue_runs_jobs_and_cleans_up(
     assert idle_pooled_connections(engines[0]) == 0
 
 
-async def test_the_worker_process_stops_at_start_without_a_broker(test_database_url: str) -> None:
-    settings = make_test_broker_settings(test_database_url, UNREACHABLE_BROKER_URL)
+async def test_the_worker_waits_for_the_broker_at_start_until_a_stop(
+    engine: AsyncEngine, test_database_url: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # An unreachable broker is an outage to wait out, not a reason to stop (ADR 0008 decision 7).
+    caplog.set_level(logging.INFO)
+    settings = make_test_broker_settings(
+        test_database_url, UNREACHABLE_BROKER_URL, startup_retry_interval_s=0.05
+    )
+    signals = StopSignals()
+    worker = asyncio.create_task(run_worker(settings, signals))
+    async with asyncio.timeout(5):
+        while caplog.text.count("broker not available at start") < 2:
+            await asyncio.sleep(0.01)
+    assert not worker.done()
 
-    with pytest.raises(ConnectionError):
-        await run_worker(settings, StopSignals())
+    signals.received(signal.SIGTERM)
+    async with asyncio.timeout(1):
+        await worker
+    assert "worker stopped during start-up" in caplog.text

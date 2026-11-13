@@ -2,16 +2,14 @@
 decision 2) and the recovery loop (ADR 0008 decision 3)."""
 
 import asyncio
-import contextlib
 import logging
 from collections.abc import Coroutine
 from typing import Any
 
-from aio_pika.abc import AbstractConnection
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from aio_pika.abc import AbstractConnection, AbstractRobustConnection
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from task_platform import safe_logging
-from task_platform.broker.connection import connect_broker
 from task_platform.broker.publisher import JobPublisher, open_job_publisher
 from task_platform.broker.queue_depth import ReadyCount
 from task_platform.broker.topology import declare_jobs_queue
@@ -23,7 +21,13 @@ from task_platform.services.recovery import (
     recover_expired_leases,
     recover_lost_messages,
 )
-from task_platform.shutdown import Ended, StopSignals, finish_unless_forced
+from task_platform.shutdown import (
+    Ended,
+    StopSignals,
+    finish_unless_forced,
+    sleep_unless_stopped,
+)
+from task_platform.startup import wait_for_dependencies
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +61,7 @@ async def poll_until_stopped(
     """Poll every `dispatch_poll_interval_s` until `stop` is set; a poll in hand ends first."""
     while not stop.is_set():
         await poll_once(session_factory, publisher, settings)
-        await _pause(settings.dispatch_poll_interval_s, stop)
+        await sleep_unless_stopped(settings.dispatch_poll_interval_s, stop)
 
 
 async def recover_once(
@@ -113,14 +117,7 @@ async def recover_until_stopped(
     # The first pass at start: jobs left by a crash wait no longer than they must.
     while not stop.is_set():
         await recover_once(session_factory, queue, settings)
-        await _pause(settings.recovery_interval_s, stop)
-
-
-async def _pause(seconds: float, stop: asyncio.Event) -> None:
-    """Sleep, unless `stop` is set first: a stop does not wait for the interval."""
-    with contextlib.suppress(TimeoutError):
-        async with asyncio.timeout(seconds):
-            await stop.wait()
+        await sleep_unless_stopped(settings.recovery_interval_s, stop)
 
 
 async def open_dispatch_publisher(
@@ -139,17 +136,31 @@ async def open_dispatch_publisher(
 
 
 async def run_dispatcher(settings: BrokerSettings, signals: StopSignals) -> None:
-    """Poll and recover until a stop signal or cancellation (ADR 0008 decision 6). Fails at start
-    if the broker or the queue declaration does.
+    """Wait for the database and the broker, then poll and recover until a stop signal or
+    cancellation (ADR 0008 decision 6). Raises StartupError on a configuration error at start
+    (ADR 0008 decision 7); fails if the queue declaration does.
 
     On the first signal the poll and the sweep in hand end with their COMMIT or ROLLBACK and no
     new ones start. A second signal cancels them: their transactions roll back, and jobs whose
     messages were already confirmed are published again on the next start (ADR 0002 decision 5).
     """
-    # First, and before the broker: creating the engine does no I/O, so a database outage only
-    # fails polls, and a bad URL fails here with no connection left open.
     engine = create_db_engine(settings)
-    connection = await connect_broker(settings)
+    try:
+        connection = await wait_for_dependencies(engine, settings, signals.stop)
+        if connection is None:
+            logger.info("dispatcher stopped during start-up")
+            return
+        await _dispatch_until_stopped(engine, connection, settings, signals)
+    finally:
+        await engine.dispose()
+
+
+async def _dispatch_until_stopped(
+    engine: AsyncEngine,
+    connection: AbstractRobustConnection,
+    settings: BrokerSettings,
+    signals: StopSignals,
+) -> None:
     try:
         publisher = await open_dispatch_publisher(connection, settings)
         logger.info("dispatcher started: queue %s", settings.jobs_queue_name)
@@ -174,7 +185,6 @@ async def run_dispatcher(settings: BrokerSettings, signals: StopSignals) -> None
                 " and its cleanup failed"
             )
     finally:
-        await engine.dispose()
         await connection.close()
 
 

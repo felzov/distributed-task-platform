@@ -5,6 +5,7 @@ asks for an immediate one. Any further signal is ignored.
 """
 
 import asyncio
+import contextlib
 import enum
 import logging
 import signal
@@ -50,6 +51,13 @@ class StopSignals:
         finally:
             for signum in STOP_SIGNALS:
                 loop.remove_signal_handler(signum)
+
+
+async def sleep_unless_stopped(seconds: float, stop: asyncio.Event) -> None:
+    """Sleep, unless `stop` is set first: a stop does not wait for the interval."""
+    with contextlib.suppress(TimeoutError):
+        async with asyncio.timeout(seconds):
+            await stop.wait()
 
 
 class Ended(enum.Enum):

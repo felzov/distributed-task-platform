@@ -61,7 +61,7 @@ class BrokerSettings(Settings):
     """
 
     broker_url: SecretStr
-    # Bounds the first connection attempt, which is not retried (the process stops instead).
+    # Bounds each connection attempt at start; a failed one is retried (ADR 0008 decision 7).
     broker_connect_timeout_s: float = Field(default=5.0, gt=0)
     # Sent in Connection.Tune-Ok, replacing the broker's proposal; missed heartbeats close it.
     # The AMQP field is 16 bits, and aiormq sends 0 (heartbeats off) for 65535 or more.
@@ -103,6 +103,10 @@ class BrokerSettings(Settings):
     # messages (ADR 0008 decision 2). A placeholder, not measured. The one-day cap keeps
     # now() - threshold inside PostgreSQL's timestamp range and rejects inf.
     lost_message_after_s: float = Field(default=600.0, gt=0, le=86400)
+    # Wait between attempts to reach the database or the broker at start, and before the worker
+    # consumes again after its queue iterator ended (ADR 0008 decisions 7 and 8). Capped at an
+    # hour, which also rejects inf.
+    startup_retry_interval_s: float = Field(default=5.0, gt=0, le=3600)
     # Pause after every recovery pass: the lease sweep, then the lost-message sweep (ADR 0008
     # decision 3). A placeholder, not measured. Capped at an hour, which also rejects inf.
     recovery_interval_s: float = Field(default=30.0, gt=0, le=3600)
