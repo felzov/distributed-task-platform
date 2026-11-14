@@ -186,8 +186,8 @@ async def recover_lost_messages(
     error, which is raised. Either way, the next pass tries again.
     """
     try:
-        # A robust channel waits for its connection during a broker outage: without this bound
-        # one read would hold the recovery loop, the lease sweep included, until the broker is back.
+        # On a link that stopped passing traffic the read waits for an answer (a cut fails it at
+        # once): without this bound it would hold the recovery loop, the lease sweep included.
         async with asyncio.timeout(settings.publish_timeout_s):
             ready = await queue.ready_messages()
     # A broker outage, a missing queue or a bug. The class only, as for every broker error.

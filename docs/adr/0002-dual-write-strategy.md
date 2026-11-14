@@ -1,6 +1,6 @@
 # ADR 0002 — Dual write: the jobs table as the outbox
 
-- **Status:** Accepted
+- **Status:** Accepted (updated 2026-11-13)
 - **Date:** 2026-10-24
 
 ## Context
@@ -51,6 +51,15 @@ not observe, and delivery is at-least-once.
    dispatched longer ago than a configured threshold. The system cannot tell a lost message from one
    still waiting in a long queue, so the threshold must be well above the expected time a message
    waits in the queue.
+
+**Update 2026-11-13 (phase 8):** decision 7 is built (ADR 0008 decision 2), with the threshold
+`lost_message_after_s` (600 s by default, a placeholder: nothing was measured). The retry-storm
+question in the consequences is settled: the sweep runs only when the jobs queue has no ready
+messages, read by a passive declare before its transaction, so a message that is only delayed in
+a backlog is not published again. The gaps that remain are in ADR 0008's consequences: a backlog
+that never drains blocks the recovery; messages a worker holds unacked are not counted; and a
+message that dies before every claim is published again once per threshold, indefinitely, with an
+ERROR each time.
 
 ## Consequences
 

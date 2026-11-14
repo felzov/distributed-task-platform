@@ -1,6 +1,6 @@
 # ADR 0004 — Dispatch and consumption over RabbitMQ
 
-- **Status:** Accepted (updated 2026-11-07, 2026-11-10)
+- **Status:** Accepted (updated 2026-11-07, 2026-11-10, 2026-11-13)
 - **Date:** 2026-10-29
 
 ## Context
@@ -175,6 +175,24 @@ records nothing (ADR 0007 decision 8). The handler's key is `notification.send:{
 result names the notification. A repeat is now counted differently: one row in `job_attempts` per
 attempt, one row in `fake_notifications` per job, and the job's result naming that row's ID. Rows
 recorded before migration 0006 have no key and keep their duplicates.
+
+**Update 2026-11-13 (phase 8, recovery and shutdown):** ADR 0008 changes what happens around the
+consumer:
+- The 2026-11-02 bullet "if aio-pika ends the consumer anyway, the worker process exits instead of
+  idling" no longer holds. The worker opens a new consumer on a new channel when its iterator ends
+  or the broker fails it, and stops only when the queue's declaration is refused (ADR 0008
+  decision 8).
+- The worker handles SIGTERM and SIGINT: it cancels its consumer, lets the message it holds finish
+  for up to `shutdown_grace_s`, and exits with status 0 (ADR 0008 decision 5). Before phase 8 a
+  signal stopped it mid-job; that still happens past the grace period or on a second signal, and
+  the message comes back counted, as decision 7 says.
+- Both processes wait for the broker at start instead of exiting (ADR 0008 decision 7).
+- The consequences that leave a job `queued` with `dispatched_at` set (a claim rejected for the
+  job's own data, a message dropped or dead-lettered before any claim) or `running` (a claim whose
+  result was lost) "until phase 8" now end: lost-message recovery publishes the first again, and
+  lease recovery takes on the second (ADR 0008 decisions 1 and 2). A claim rejected for bad data
+  is rejected again on every republish, so such a job is published again once per threshold,
+  indefinitely, with an ERROR logged each time (ADR 0008, consequences).
 
 ## Consequences
 

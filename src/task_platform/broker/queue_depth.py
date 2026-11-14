@@ -21,9 +21,9 @@ class ReadyCount:
     async def ready_messages(self) -> int:
         """The queue's ready messages now. Raises if the broker cannot answer.
 
-        Not bounded here: during a broker outage a robust channel waits for its connection to come
-        back, so the caller bounds the call. After an error, such as a missing queue, the next
-        call opens a new channel.
+        Not bounded here, so the caller bounds the call: on a cut connection it fails at once
+        (observed), but on a link that stopped passing traffic it waits for an answer. After an
+        error, such as a missing queue, the next call opens a new channel.
         """
         if self._channel is None:
             # Never publishes, so no confirms.
