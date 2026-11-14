@@ -4,6 +4,7 @@ check, configuration errors that stop the process, and outages it waits out thro
 import asyncio
 import logging
 import signal
+from urllib.parse import unquote, urlsplit
 
 import pytest
 from sqlalchemy.exc import DBAPIError
@@ -273,6 +274,8 @@ async def test_a_process_waiting_for_the_broker_stops_on_a_signal_with_status_0(
             "DATABASE_URL": test_database_url,
             "BROKER_URL": proxy.url(test_broker_url),
             "STARTUP_RETRY_INTERVAL_S": "0.1",
+            # The libraries' DEBUG lines name the broker they try: never with its password.
+            "LOG_LEVEL": "DEBUG",
         }
 
         async def retrying(stderr: bytes) -> bool:
@@ -282,3 +285,6 @@ async def test_a_process_waiting_for_the_broker_stops_on_a_signal_with_status_0(
 
     assert status == 0
     assert_not_logged(stderr, b"Traceback")
+    password = urlsplit(test_broker_url).password
+    assert password, "the test broker URL holds no password to look for"
+    assert_not_logged(stderr, unquote(password).encode())

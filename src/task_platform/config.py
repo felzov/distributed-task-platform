@@ -3,7 +3,7 @@
 All limits and timeouts are explicit here. The defaults are placeholders, not measured values.
 """
 
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -114,6 +114,10 @@ class BrokerSettings(Settings):
     # Pause after every recovery pass: the lease sweep, then the lost-message sweep (ADR 0008
     # decision 3). A placeholder, not measured. Capped at an hour, which also rejects inf.
     recovery_interval_s: float = Field(default=30.0, gt=0, le=3600)
+    # The dispatcher's and the worker's log level (ADR 0008); SQLAlchemy's engine stays at WARNING
+    # whatever it is (`log_config`). Case-insensitive. No ERROR: it would hide every WARNING, the
+    # start-up retries and failed polls among them, and a waiting process would look hung.
+    log_level: Literal["DEBUG", "INFO", "WARNING"] = "INFO"
 
     @model_validator(mode="after")
     def _publish_timeout_within_statement_timeout(self) -> Self:
@@ -139,6 +143,11 @@ class BrokerSettings(Settings):
         if self.retry_base_delay_s > self.retry_max_delay_s:
             raise ValueError("retry_base_delay_s must not exceed retry_max_delay_s")
         return self
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _upper_case(cls, level: object) -> object:
+        return level.upper() if isinstance(level, str) else level
 
     @field_validator("jobs_queue_name")
     @classmethod

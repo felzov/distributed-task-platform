@@ -420,3 +420,24 @@ def test_startup_retry_interval_bounds(interval_s: float, accepted: bool) -> Non
     else:
         with pytest.raises(ValidationError, match="startup_retry_interval_s"):
             broker_settings(**values)
+
+
+@pytest.mark.parametrize(
+    ("level", "expected"),
+    [("INFO", "INFO"), ("debug", "DEBUG"), ("Warning", "WARNING")],
+)
+def test_log_level_is_read_case_insensitively(level: str, expected: str) -> None:
+    values = {"database_url": URL, "broker_url": BROKER_URL, "log_level": level}
+    assert broker_settings(**values).log_level == expected
+
+
+def test_log_level_defaults_to_info() -> None:
+    assert broker_settings(database_url=URL, broker_url=BROKER_URL).log_level == "INFO"
+
+
+# ERROR would hide every WARNING: start-up retries, failed polls, skipped sweeps, broker alarms.
+@pytest.mark.parametrize("level", ["VERBOSE", "", "10", 10, "ERROR", "critical"])
+def test_an_unknown_log_level_is_rejected(level: object) -> None:
+    values = {"database_url": URL, "broker_url": BROKER_URL, "log_level": level}
+    with pytest.raises(ValidationError, match="log_level"):
+        broker_settings(**values)
