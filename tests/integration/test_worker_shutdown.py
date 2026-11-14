@@ -24,7 +24,7 @@ from task_platform.domain.payloads import NOTIFICATION_SEND, PayloadModel
 from task_platform.services.execution import ClaimedJob, Handler
 from task_platform.shutdown import StopSignals
 from task_platform.worker.process import consume_until_stopped, open_jobs_queue
-from tests.integration.processes import stop_with_signal
+from tests.integration.processes import assert_not_logged, stop_with_signal
 from tests.integration.rows import insert_job
 from tests.settings import make_test_broker_settings
 
@@ -329,5 +329,4 @@ async def test_the_worker_process_exits_with_status_0_on_a_signal(
     status, stderr = await stop_with_signal("task_platform.worker", env, consuming, signum)
 
     assert status == 0
-    # Not printed on failure: the child's errors could quote its settings.
-    assert b"Traceback" not in stderr
+    assert_not_logged(stderr, b"Traceback")

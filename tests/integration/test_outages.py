@@ -25,7 +25,7 @@ from task_platform.main import create_app
 from task_platform.shutdown import StopSignals
 from task_platform.worker.process import run_worker
 from tests.app_client import app_client
-from tests.integration.processes import child_process
+from tests.integration.processes import assert_logged, assert_not_logged, child_process
 from tests.integration.rows import fake_notification_rows, insert_job
 from tests.proxy import TcpProxy, running_proxy
 from tests.settings import make_test_broker_settings, make_test_settings
@@ -243,15 +243,18 @@ async def stop_twice(child: asyncio.subprocess.Process) -> tuple[int, float]:
 
 
 def assert_no_stray_errors(stderr: bytes, link: str) -> None:
-    # Not printed on failure: the child's errors could quote its settings.
-    assert b"Task was destroyed" not in stderr
-    assert b"never retrieved" not in stderr
+    __tracebackhide__ = True  # pytest would show `stderr`, the child's whole output
+    assert_not_logged(stderr, b"Task was destroyed")
+    assert_not_logged(stderr, b"never retrieved")
     if link == "broker":
-        assert b"Traceback" not in stderr
+        assert_not_logged(stderr, b"Traceback")
     else:
         # SQLAlchemy records the close of a pooled connection that the stop cut short ("Exception
-        # closing connection", a CancelledError in asyncpg's close) with a traceback.
-        assert stderr.count(b"Traceback") == stderr.count(b"Exception closing connection")
+        # closing connection", a CancelledError in asyncpg's close) with a traceback. Counted
+        # first: pytest would show the stderr a failing count was taken from.
+        tracebacks = stderr.count(b"Traceback")
+        closes = stderr.count(b"Exception closing connection")
+        assert tracebacks == closes, f"{tracebacks - closes} unexpected tracebacks"
 
 
 @pytest.mark.parametrize(
@@ -303,7 +306,7 @@ async def test_a_second_signal_stops_an_idle_process_whose_link_froze(
     if cut_short is None:
         assert elapsed < float(FROZEN_CLOSE_BOUND_S) + 0.5
     else:
-        assert cut_short + b" cut short by the second signal" in stderr
+        assert_logged(bytes(stderr), cut_short + b" cut short by the second signal")
         assert elapsed < 1.5
     assert_no_stray_errors(bytes(stderr), link)
 
@@ -336,8 +339,9 @@ async def test_a_second_signal_stops_a_dispatcher_whose_poll_is_stuck_on_a_froze
             status, elapsed = await stop_twice(child)
 
     assert status == 0
-    assert b"dispatcher stopped on a second signal: the poll or sweep in hand was cancelled" in (
-        stderr
+    assert_logged(
+        bytes(stderr),
+        b"dispatcher stopped on a second signal: the poll or sweep in hand was cancelled",
     )
     # SQLAlchemy closes the cancelled poll's connection inside asyncio.shield with a 2 s timeout
     # (sqlalchemy/connectors/asyncio.py and dialects/postgresql/asyncpg.py, 2.1.6): no cancel cuts

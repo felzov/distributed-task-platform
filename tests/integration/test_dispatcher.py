@@ -24,7 +24,7 @@ from task_platform.dispatcher.process import poll_until_stopped, recover_once, r
 from task_platform.domain.messages import encode_job_message
 from task_platform.services.dispatch import DispatchPoll, dispatch_due_jobs
 from task_platform.shutdown import StopSignals
-from tests.integration.processes import stop_with_signal
+from tests.integration.processes import assert_not_logged, stop_with_signal
 from tests.integration.rows import insert_job
 from tests.settings import make_test_broker_settings
 
@@ -452,8 +452,7 @@ async def test_the_dispatcher_process_exits_with_status_0_on_a_signal(
     status, stderr = await stop_with_signal("task_platform.dispatcher", env, polling, signum)
 
     assert status == 0
-    # Not printed on failure: the child's errors could quote its settings.
-    assert b"Traceback" not in stderr
+    assert_not_logged(stderr, b"Traceback")
 
 
 async def stop_if_running(task: asyncio.Task[Any]) -> None:

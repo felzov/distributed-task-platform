@@ -14,7 +14,12 @@ from task_platform.config import BrokerSettings
 from task_platform.data.db import create_db_engine
 from task_platform.data.schema import SCHEMA_REVISION, current_revisions
 from task_platform.startup import StartupError, wait_for_broker, wait_for_schema
-from tests.integration.processes import run_to_exit, stop_with_signal
+from tests.integration.processes import (
+    assert_logged,
+    assert_not_logged,
+    run_to_exit,
+    stop_with_signal,
+)
 from tests.proxy import running_proxy
 from tests.settings import UNREACHABLE_BROKER_URL, make_test_broker_settings, with_url_parts
 
@@ -253,10 +258,9 @@ async def test_a_process_with_a_wrong_database_password_exits_with_status_1(
     status, stderr = await run_to_exit(module, env)
 
     assert status == 1
-    # Not printed on failure: the child's errors could quote its settings.
-    assert b"the database cannot be used at start" in stderr
-    assert b"Traceback" not in stderr
-    assert WRONG_PASSWORD.encode() not in stderr
+    assert_logged(stderr, b"the database cannot be used at start")
+    assert_not_logged(stderr, b"Traceback")
+    assert_not_logged(stderr, WRONG_PASSWORD.encode())
 
 
 @pytest.mark.parametrize("module", MODULES)
@@ -277,4 +281,4 @@ async def test_a_process_waiting_for_the_broker_stops_on_a_signal_with_status_0(
         status, stderr = await stop_with_signal(module, env, retrying, signal.SIGTERM)
 
     assert status == 0
-    assert b"Traceback" not in stderr
+    assert_not_logged(stderr, b"Traceback")
