@@ -343,3 +343,101 @@ def test_retry_base_must_not_exceed_the_cap(base_s: float, accepted: bool) -> No
     else:
         with pytest.raises(ValidationError, match="retry_base_delay_s must not exceed"):
             broker_settings(**values)
+
+
+@pytest.mark.parametrize(
+    ("threshold_s", "accepted"),
+    [
+        (0.001, True),
+        (86400.0, True),
+        (0, False),
+        (86400.001, False),
+        (float("inf"), False),
+        (float("nan"), False),
+    ],
+)
+def test_lost_message_threshold_bounds(threshold_s: float, accepted: bool) -> None:
+    # ADR 0008 decision 2; the cap also keeps now() - threshold inside PostgreSQL's range.
+    values = {"database_url": URL, "broker_url": BROKER_URL, "lost_message_after_s": threshold_s}
+    if accepted:
+        assert broker_settings(**values).lost_message_after_s == threshold_s
+    else:
+        with pytest.raises(ValidationError, match="lost_message_after_s"):
+            broker_settings(**values)
+
+
+@pytest.mark.parametrize(
+    ("interval_s", "accepted"),
+    [(0.001, True), (3600.0, True), (0, False), (3600.001, False), (float("inf"), False)],
+)
+def test_recovery_interval_bounds(interval_s: float, accepted: bool) -> None:
+    # ADR 0008 decision 3.
+    values = {"database_url": URL, "broker_url": BROKER_URL, "recovery_interval_s": interval_s}
+    if accepted:
+        assert broker_settings(**values).recovery_interval_s == interval_s
+    else:
+        with pytest.raises(ValidationError, match="recovery_interval_s"):
+            broker_settings(**values)
+
+
+@pytest.mark.parametrize(
+    ("grace_s", "accepted"),
+    [
+        (0.001, True),
+        (1799.9, True),
+        (0, False),
+        (1800.0, False),
+        (float("inf"), False),
+        (float("nan"), False),
+    ],
+)
+def test_shutdown_grace_bounds(grace_s: float, accepted: bool) -> None:
+    # ADR 0008 decision 5: the held message stays unacked for the grace period, so it stays below
+    # RabbitMQ's default consumer_timeout of 30 minutes.
+    values = {"database_url": URL, "broker_url": BROKER_URL, "shutdown_grace_s": grace_s}
+    if accepted:
+        assert broker_settings(**values).shutdown_grace_s == grace_s
+    else:
+        with pytest.raises(ValidationError, match="shutdown_grace_s"):
+            broker_settings(**values)
+
+
+@pytest.mark.parametrize(
+    ("interval_s", "accepted"),
+    [
+        (0.001, True),
+        (3600.0, True),
+        (0, False),
+        (3600.1, False),
+        (float("inf"), False),
+        (float("nan"), False),
+    ],
+)
+def test_startup_retry_interval_bounds(interval_s: float, accepted: bool) -> None:
+    values = {"database_url": URL, "broker_url": BROKER_URL, "startup_retry_interval_s": interval_s}
+    if accepted:
+        assert broker_settings(**values).startup_retry_interval_s == interval_s
+    else:
+        with pytest.raises(ValidationError, match="startup_retry_interval_s"):
+            broker_settings(**values)
+
+
+@pytest.mark.parametrize(
+    ("level", "expected"),
+    [("INFO", "INFO"), ("debug", "DEBUG"), ("Warning", "WARNING")],
+)
+def test_log_level_is_read_case_insensitively(level: str, expected: str) -> None:
+    values = {"database_url": URL, "broker_url": BROKER_URL, "log_level": level}
+    assert broker_settings(**values).log_level == expected
+
+
+def test_log_level_defaults_to_info() -> None:
+    assert broker_settings(database_url=URL, broker_url=BROKER_URL).log_level == "INFO"
+
+
+# ERROR would hide every WARNING: start-up retries, failed polls, skipped sweeps, broker alarms.
+@pytest.mark.parametrize("level", ["VERBOSE", "", "10", 10, "ERROR", "critical"])
+def test_an_unknown_log_level_is_rejected(level: object) -> None:
+    values = {"database_url": URL, "broker_url": BROKER_URL, "log_level": level}
+    with pytest.raises(ValidationError, match="log_level"):
+        broker_settings(**values)

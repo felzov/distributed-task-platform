@@ -4,6 +4,7 @@ delivery, a database outage, a deleted queue and the process wiring (ADR 0004 de
 import asyncio
 import json
 import logging
+import signal
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -15,15 +16,22 @@ from aio_pika.abc import AbstractIncomingMessage, AbstractRobustConnection
 from sqlalchemy import QueuePool, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from task_platform import startup
 from task_platform.broker.connection import connect_broker
 from task_platform.broker.topology import dead_letter_queue_name, declare_jobs_queue
 from task_platform.config import BrokerSettings
 from task_platform.data.db import create_db_engine
 from task_platform.domain.messages import encode_job_message
 from task_platform.services.execution import Outcome, execute_job
+from task_platform.shutdown import StopSignals
 from task_platform.worker import process
 from task_platform.worker.handlers import HANDLERS
-from task_platform.worker.process import Delivery, consume_forever, open_jobs_queue, run_worker
+from task_platform.worker.process import (
+    Delivery,
+    consume_until_stopped,
+    open_jobs_queue,
+    run_worker,
+)
 from tests.integration.rows import fake_notification_rows, fake_result, insert_job
 from tests.settings import (
     UNREACHABLE_BROKER_URL,
@@ -149,6 +157,13 @@ async def take_dead_letter(
     return await take(connection, dead)
 
 
+async def wait_for_ready(connection: AbstractRobustConnection, queue_name: str, count: int) -> None:
+    """Wait until the queue holds exactly `count` ready messages; fail after 10 s."""
+    async with asyncio.timeout(10):
+        while await ready_messages(connection, queue_name) != count:
+            await asyncio.sleep(0.05)
+
+
 async def wait_for(answers: list[str], count: int) -> None:
     async with asyncio.timeout(10):
         while len(answers) < count:
@@ -164,7 +179,16 @@ async def worker(
     """A consumer on a channel of its own, as run_worker sets it up. Closing the channel on exit
     gives the broker back any message the worker had not answered."""
     queue = await open_jobs_queue(connection, settings)
-    task = asyncio.create_task(consume_forever(queue, sessions, HANDLERS, settings))
+    task = asyncio.create_task(
+        consume_until_stopped(
+            queue,
+            lambda: open_jobs_queue(connection, settings),
+            sessions,
+            HANDLERS,
+            settings,
+            StopSignals(),
+        )
+    )
     try:
         yield
     finally:
@@ -295,8 +319,10 @@ async def test_a_database_outage_keeps_the_message_without_counting_it(
     assert delivery_counts[:2] == [0, 0]
     assert await job_row(engine, job_id) == before
     # Still in the queue once the worker has stopped, and not dead-lettered: lost and
-    # dead-lettered would look the same from the jobs queue alone.
-    assert await ready_messages(broker_connection, settings.jobs_queue_name) == 1
+    # dead-lettered would look the same from the jobs queue alone. Waited for, not read once: a
+    # delivery the worker still held at stop came back to the quorum queue up to ~0.1 s after
+    # its channel closed (observed on RabbitMQ 4.3.7).
+    await wait_for_ready(broker_connection, settings.jobs_queue_name, 1)
     assert (
         await ready_messages(broker_connection, dead_letter_queue_name(settings.jobs_queue_name))
         == 0
@@ -381,6 +407,9 @@ async def test_a_message_held_by_a_stopped_worker_comes_back_counted(
     async with worker(broker_connection, sessions, settings), asyncio.timeout(5):
         await received.wait()
 
+    # Back in the queue shortly after the channel closed, not at once (see the database outage
+    # test above).
+    await wait_for_ready(broker_connection, settings.jobs_queue_name, 1)
     message = await take(broker_connection, settings.jobs_queue_name)
     assert message.body == encode_job_message(job_id)
     assert (message.headers or {}).get("x-delivery-count") == 1
@@ -443,11 +472,11 @@ async def test_the_worker_process_declares_the_queue_runs_jobs_and_cleans_up(
         engines.append(create_db_engine(settings))
         return engines[-1]
 
-    monkeypatch.setattr(process, "connect_broker", recording_connect_broker)
+    monkeypatch.setattr(startup, "connect_broker", recording_connect_broker)
     monkeypatch.setattr(process, "create_db_engine", recording_create_db_engine)
     job_id = await insert_due_job(engine)
 
-    task = asyncio.create_task(run_worker(settings))
+    task = asyncio.create_task(run_worker(settings, StopSignals()))
     try:
         # The worker declares the queue: before that, a publish would go nowhere.
         await wait_until_queue_exists(broker_connection, settings.jobs_queue_name)
@@ -467,8 +496,22 @@ async def test_the_worker_process_declares_the_queue_runs_jobs_and_cleans_up(
     assert idle_pooled_connections(engines[0]) == 0
 
 
-async def test_the_worker_process_stops_at_start_without_a_broker(test_database_url: str) -> None:
-    settings = make_test_broker_settings(test_database_url, UNREACHABLE_BROKER_URL)
+async def test_the_worker_waits_for_the_broker_at_start_until_a_stop(
+    engine: AsyncEngine, test_database_url: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # An unreachable broker is an outage to wait out, not a reason to stop (ADR 0008 decision 7).
+    caplog.set_level(logging.INFO)
+    settings = make_test_broker_settings(
+        test_database_url, UNREACHABLE_BROKER_URL, startup_retry_interval_s=0.05
+    )
+    signals = StopSignals()
+    worker = asyncio.create_task(run_worker(settings, signals))
+    async with asyncio.timeout(5):
+        while caplog.text.count("broker not available at start") < 2:
+            await asyncio.sleep(0.01)
+    assert not worker.done()
 
-    with pytest.raises(ConnectionError):
-        await run_worker(settings)
+    signals.received(signal.SIGTERM)
+    async with asyncio.timeout(1):
+        await worker
+    assert "worker stopped during start-up" in caplog.text

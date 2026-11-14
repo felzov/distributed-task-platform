@@ -1,5 +1,7 @@
 """Settings for tests: only the values a test passes, never a developer's .env or shell."""
 
+from urllib.parse import urlsplit, urlunsplit
+
 from task_platform.config import BrokerSettings, Settings
 
 # A closed port: any database access fails at once with ConnectionRefusedError.
@@ -30,3 +32,13 @@ def make_test_broker_settings(
     }
     values = defaults | {"database_url": database_url, "broker_url": broker_url} | overrides
     return BrokerSettings(_env_file=None, **values)
+
+
+def with_url_parts(url: str, *, password: str | None = None, path: str | None = None) -> str:
+    """`url` with its password or path (database, vhost) replaced; everything else kept."""
+    parts = urlsplit(url)
+    netloc = parts.netloc
+    if password is not None:
+        _, _, host = netloc.rpartition("@")
+        netloc = f"{parts.username}:{password}@{host}"
+    return urlunsplit(parts._replace(netloc=netloc, path=parts.path if path is None else path))

@@ -1,6 +1,6 @@
 # ADR 0005 — Retries and attempt records
 
-- **Status:** Accepted (updated 2026-11-10)
+- **Status:** Accepted (updated 2026-11-10, 2026-11-13)
 - **Date:** 2026-11-05
 
 ## Context
@@ -63,6 +63,14 @@ no longer holds for `notification.send`: a retry after the provider was called, 
 handler then raised or timed out, gets the same notification back and records nothing new (ADR
 0007 decision 8; tested for both codes, and end to end with three attempts that each reach the
 provider). It still holds for any future handler whose receiver takes no key.
+
+**Update 2026-11-13 (phase 8):** an expired lease is an exception to decisions 1 and 3 (ADR 0008
+decision 1). `lease_expired` is retryable, though it is not a failure of the handler itself: the
+worker may have crashed or been stopped, and the next attempt may not end the same way. Its job
+goes back to `queued` due at once, with no backoff, since the lease already ran its full length.
+Decision 5's open attempt row is now closed by lease recovery, as `failed` with `lease_expired`,
+in the same transaction as the job's update; a missing row is logged as an ERROR and does not stop
+the recovery.
 
 ## Consequences
 

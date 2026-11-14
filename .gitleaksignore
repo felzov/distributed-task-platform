@@ -1,2 +1,6 @@
 # README.md example Idempotency-Key (a sample UUID, not a secret), flagged as generic-api-key.
 32baee6bde2ec52580454e5d754351f2623ecfa2:README.md:generic-api-key:109
+# Test-only sentinel passwords (never real credentials) in variables named PASSWORD and
+# WRONG_PASSWORD, flagged as generic-api-key.
+56f917a1bb60c957f5fa5fdc2b7338432b88652a:tests/integration/test_startup.py:generic-api-key:23
+56f917a1bb60c957f5fa5fdc2b7338432b88652a:tests/unit/test_startup.py:generic-api-key:28

@@ -18,10 +18,15 @@ def test_every_failure_code_is_classified_for_retries() -> None:
     assert set(RETRYABLE) == set(FailureCode)
 
 
-def test_only_the_handlers_own_failures_are_retryable() -> None:
-    # Written out from ADR 0005 decision 1, independently of RETRYABLE.
+def test_the_handlers_own_failures_and_an_expired_lease_are_retryable() -> None:
+    # Written out from ADR 0005 decision 1 and its exception in ADR 0008 decision 1, independently
+    # of RETRYABLE.
     retryable = {code for code, retry in RETRYABLE.items() if retry}
-    assert retryable == {FailureCode.HANDLER_ERROR, FailureCode.HANDLER_TIMEOUT}
+    assert retryable == {
+        FailureCode.HANDLER_ERROR,
+        FailureCode.HANDLER_TIMEOUT,
+        FailureCode.LEASE_EXPIRED,
+    }
 
 
 @pytest.mark.parametrize("message", [*FAILURE_MESSAGES.values(), UNKNOWN_FAILURE_MESSAGE])

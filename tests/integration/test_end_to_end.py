@@ -1,6 +1,7 @@
 """A job's whole path on real PostgreSQL and RabbitMQ: `POST /jobs` saves it, one dispatcher poll
 publishes it, a worker runs it, and `GET /jobs/{id}` reports it succeeded. Then the same path with
-failed attempts: retried after a backoff and published again, until they succeed or run out."""
+failed attempts: retried after a backoff and published again, until they succeed or run out. Then
+a worker that crashes mid-job: its job is recovered once its lease expires (ADR 0008)."""
 
 import asyncio
 import logging
@@ -16,14 +17,20 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from task_platform.broker.connection import connect_broker
 from task_platform.config import BrokerSettings
-from task_platform.dispatcher.process import open_dispatch_publisher, poll_forever, poll_once
+from task_platform.dispatcher.process import (
+    open_dispatch_publisher,
+    poll_once,
+    poll_until_stopped,
+    run_dispatcher,
+)
 from task_platform.domain.payloads import NOTIFICATION_SEND, PayloadModel
 from task_platform.main import create_app
 from task_platform.services.dispatch import Publisher
 from task_platform.services.execution import ClaimedJob, Handler
 from task_platform.services.notifications import send_notification
+from task_platform.shutdown import StopSignals
 from task_platform.worker.handlers import HANDLERS
-from task_platform.worker.process import consume_forever, open_jobs_queue
+from task_platform.worker.process import consume_until_stopped, open_jobs_queue
 from tests.app_client import app_client
 from tests.integration.rows import fake_notification_rows, fake_result
 from tests.settings import make_test_broker_settings, make_test_settings
@@ -100,7 +107,16 @@ async def test_a_submitted_job_is_dispatched_run_once_and_reported_succeeded(
         worker_connection = await connect_broker(settings)
         try:
             queue = await open_jobs_queue(worker_connection, settings)
-            worker = asyncio.create_task(consume_forever(queue, sessions, HANDLERS, settings))
+            worker = asyncio.create_task(
+                consume_until_stopped(
+                    queue,
+                    lambda: open_jobs_queue(worker_connection, settings),
+                    sessions,
+                    HANDLERS,
+                    settings,
+                    StopSignals(),
+                )
+            )
             try:
                 status = await wait_until_succeeded(client, job_id)
                 # The worker acks after the final update has committed, so `succeeded` can show
@@ -180,8 +196,17 @@ async def running(
     try:
         queue = await open_jobs_queue(worker_connection, settings)
         tasks = [
-            asyncio.create_task(poll_forever(sessions, publisher, settings)),
-            asyncio.create_task(consume_forever(queue, sessions, handlers, settings)),
+            asyncio.create_task(poll_until_stopped(sessions, publisher, settings, asyncio.Event())),
+            asyncio.create_task(
+                consume_until_stopped(
+                    queue,
+                    lambda: open_jobs_queue(worker_connection, settings),
+                    sessions,
+                    handlers,
+                    settings,
+                    StopSignals(),
+                )
+            ),
         ]
         try:
             yield
@@ -418,3 +443,124 @@ async def test_a_job_that_always_fails_stops_after_its_attempts(
         assert sentinel not in attempts_response.text
         assert sentinel not in failed_response.text
     assert ERROR_SENTINEL not in await stored_text(engine, job_id)
+
+
+# Crash recovery
+
+
+def crashing_handlers(sent: asyncio.Event) -> Mapping[str, Handler]:
+    """The real handler, after which the worker hangs until it is killed: a crash after the side
+    effect, the case the handler's idempotency key exists for (ADR 0007)."""
+
+    async def handler(
+        session_factory: async_sessionmaker[AsyncSession], job: ClaimedJob, payload: PayloadModel
+    ) -> dict[str, Any]:
+        await send_notification(session_factory, job, payload)
+        sent.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    return {NOTIFICATION_SEND: handler}
+
+
+async def test_a_job_whose_worker_crashed_is_recovered_and_succeeds_with_one_notification(
+    engine: AsyncEngine,
+    settings: BrokerSettings,
+    broker_connection: AbstractRobustConnection,
+    test_database_url: str,
+    answers: list[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    # A three-second lease and short loops, so recovery comes within about three seconds of the
+    # claim. Margins, not tight bounds: the first worker must be killed before its two-second
+    # handler timeout fires, or attempt 1 would end as handler_timeout instead of a crash.
+    crash_settings = settings.model_copy(
+        update={
+            "lease_duration_s": 3.0,
+            "handler_timeout_s": 2.0,
+            "dispatch_poll_interval_s": 0.05,
+            "recovery_interval_s": 0.05,
+        }
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    sent = asyncio.Event()
+
+    async with app_client(create_app(make_test_settings(test_database_url))) as client:
+        job_id = (await client.post("/jobs", json=JOB)).json()["id"]
+        # The whole dispatcher process: poll loop and recovery loop.
+        dispatcher = asyncio.create_task(run_dispatcher(crash_settings, StopSignals()))
+        try:
+            # The first worker sends the notification, then dies before its final update: its
+            # task is cancelled and its connection closed, as for a killed process.
+            first_connection = await connect_broker(crash_settings)
+            try:
+                queue = await open_jobs_queue(first_connection, crash_settings)
+                first = asyncio.create_task(
+                    consume_until_stopped(
+                        queue,
+                        lambda: open_jobs_queue(first_connection, crash_settings),
+                        sessions,
+                        crashing_handlers(sent),
+                        crash_settings,
+                        StopSignals(),
+                    )
+                )
+                async with asyncio.timeout(5):
+                    await sent.wait()
+                first.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await first
+            finally:
+                await first_connection.close()
+            assert (await client.get(f"/jobs/{job_id}")).json()["status"] == "running"
+
+            # A second worker gets the job once recovery requeued it and the dispatcher published
+            # it again. The first message, returned by the crash, reaches it too, and is acked
+            # with whichever claim it loses.
+            second_connection = await connect_broker(crash_settings)
+            try:
+                queue = await open_jobs_queue(second_connection, crash_settings)
+                second = asyncio.create_task(
+                    consume_until_stopped(
+                        queue,
+                        lambda: open_jobs_queue(second_connection, crash_settings),
+                        sessions,
+                        HANDLERS,
+                        crash_settings,
+                        StopSignals(),
+                    )
+                )
+                try:
+                    status = await wait_until(client, job_id, "succeeded")
+                    await wait_for_answers(answers, 2)
+                finally:
+                    second.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await second
+            finally:
+                await second_connection.close()
+        finally:
+            dispatcher.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await dispatcher
+        attempts_response = await client.get(f"/jobs/{job_id}/attempts")
+    attempts = attempts_response.json()["attempts"]
+
+    # Criterion 1: requeued with lease_expired, its attempt row closed, published again, and the
+    # next attempt succeeded.
+    assert answers == ["ack", "ack"]
+    assert status["attempts"] == 2
+    assert [(a["attempt"], a["outcome"]) for a in attempts] == [(1, "failed"), (2, "succeeded")]
+    assert [a["failure"] and a["failure"]["code"] for a in attempts] == ["lease_expired", None]
+    # The handler ran twice but the provider deduplicated by key: one notification, and it is the
+    # job's result (ADR 0007).
+    [notification] = await fake_notification_rows(engine, job_id)
+    assert notification["attempt"] == 1
+    assert status["result"] == fake_result(notification)
+    assert await queued_messages(broker_connection, crash_settings) == 0
+    assert "lease recovery: 1 expired, 1 requeued, 0 failed" in caplog.text
+    # The recovery's own WARNING is the only thing that went wrong on the way.
+    assert warnings(caplog) == [f"job {job_id} attempt 1 of 5: lease expired; requeued"]
+    assert SENTINEL not in caplog.text
+    assert SENTINEL not in attempts_response.text

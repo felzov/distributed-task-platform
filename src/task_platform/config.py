@@ -3,7 +3,7 @@
 All limits and timeouts are explicit here. The defaults are placeholders, not measured values.
 """
 
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -17,6 +17,8 @@ class Settings(BaseSettings):
 
     # SecretStr keeps the password out of repr(), logs and tracebacks.
     database_url: SecretStr
+    # Bounds each connection attempt, and in the dispatcher and the worker the database pool's
+    # close at a stop (ADR 0008 decisions 5 and 6).
     db_connect_timeout_s: float = Field(default=5.0, gt=0)
     # Server-side limit per statement, set on every connection.
     db_statement_timeout_ms: int = Field(default=5_000, gt=0)
@@ -61,7 +63,9 @@ class BrokerSettings(Settings):
     """
 
     broker_url: SecretStr
-    # Bounds the first connection attempt, which is not retried (the process stops instead).
+    # Bounds each connection attempt at start; a failed one is retried (ADR 0008 decision 7). Also
+    # bounds the connection's close at a stop and the worker's closes of a channel it gives up on
+    # (decisions 5, 6 and 8).
     broker_connect_timeout_s: float = Field(default=5.0, gt=0)
     # Sent in Connection.Tune-Ok, replacing the broker's proposal; missed heartbeats close it.
     # The AMQP field is 16 bits, and aiormq sends 0 (heartbeats off) for 65535 or more.
@@ -78,12 +82,17 @@ class BrokerSettings(Settings):
     # Pause after every poll, so at most dispatch_batch_size jobs go out per interval.
     dispatch_poll_interval_s: float = Field(default=1.0, gt=0)
 
-    # How long a claimed job belongs to its worker; phase 8 recovers jobs whose lease expired.
+    # How long a claimed job belongs to its worker; lease recovery takes on a job whose lease
+    # expired (ADR 0008 decision 1).
     # Below RabbitMQ's default consumer_timeout of 30 minutes (ADR 0004 decision 8); the bound
     # also rejects inf and values past PostgreSQL's timestamp range, which would fail every claim.
     lease_duration_s: float = Field(default=120.0, gt=0, lt=1800)
     # A handler still running after this is cancelled and the job fails as handler_timeout.
     handler_timeout_s: float = Field(default=60.0, gt=0)
+    # How long a stopping worker waits for the job in hand (ADR 0008 decision 5). Shorter than
+    # handler_timeout_s on purpose: a stop should not wait for the slowest handler the timeout
+    # allows. The message stays unacked meanwhile, so the cap is RabbitMQ's consumer_timeout.
+    shutdown_grace_s: float = Field(default=30.0, gt=0, lt=1800)
     # Wait after a database error at the claim, before the message goes back with nack (ADR 0004
     # decision 6). The worker holds the message unacknowledged meanwhile, for the claim's own
     # timeouts plus this wait, so it is capped below RabbitMQ's default consumer_timeout (30 min).
@@ -94,6 +103,21 @@ class BrokerSettings(Settings):
     # bound it; the one-day cap keeps available_at far inside PostgreSQL's timestamp range.
     retry_base_delay_s: float = Field(default=2.0, gt=0)
     retry_max_delay_s: float = Field(default=300.0, gt=0, le=86400)
+    # A queued job published this long ago is published again once the jobs queue has no ready
+    # messages (ADR 0008 decision 2). A placeholder, not measured. The one-day cap keeps
+    # now() - threshold inside PostgreSQL's timestamp range and rejects inf.
+    lost_message_after_s: float = Field(default=600.0, gt=0, le=86400)
+    # Wait between attempts to reach the database or the broker at start, and before the worker
+    # consumes again after its queue iterator ended (ADR 0008 decisions 7 and 8). Capped at an
+    # hour, which also rejects inf.
+    startup_retry_interval_s: float = Field(default=5.0, gt=0, le=3600)
+    # Pause after every recovery pass: the lease sweep, then the lost-message sweep (ADR 0008
+    # decision 3). A placeholder, not measured. Capped at an hour, which also rejects inf.
+    recovery_interval_s: float = Field(default=30.0, gt=0, le=3600)
+    # The dispatcher's and the worker's log level (ADR 0008); SQLAlchemy's engine stays at WARNING
+    # whatever it is (`log_config`). Case-insensitive. No ERROR: it would hide every WARNING, the
+    # start-up retries and failed polls among them, and a waiting process would look hung.
+    log_level: Literal["DEBUG", "INFO", "WARNING"] = "INFO"
 
     @model_validator(mode="after")
     def _publish_timeout_within_statement_timeout(self) -> Self:
@@ -119,6 +143,11 @@ class BrokerSettings(Settings):
         if self.retry_base_delay_s > self.retry_max_delay_s:
             raise ValueError("retry_base_delay_s must not exceed retry_max_delay_s")
         return self
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _upper_case(cls, level: object) -> object:
+        return level.upper() if isinstance(level, str) else level
 
     @field_validator("jobs_queue_name")
     @classmethod

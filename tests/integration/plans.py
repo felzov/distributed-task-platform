@@ -3,7 +3,7 @@ plan, which asyncpg's prepared statements can get after five runs."""
 
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import event, text
 from sqlalchemy.engine import Connection
@@ -18,6 +18,8 @@ def _literal(value: object) -> str:
         return str(value)
     if isinstance(value, datetime):
         return f"'{value.isoformat()}'"
+    if isinstance(value, timedelta):
+        return f"'{value.total_seconds()} seconds'"
     if isinstance(value, uuid.UUID | str):
         return "'" + str(value).replace("'", "''") + "'"
     raise TypeError(f"no literal for a {type(value).__name__} parameter")

@@ -5,7 +5,13 @@ import pytest
 from task_platform.domain.failures import FailureCode
 from task_platform.domain.retries import AfterFailure, after_failure
 
-RETRYABLE_CODES = [FailureCode.HANDLER_ERROR, FailureCode.HANDLER_TIMEOUT]
+# An expired lease is retried like the handler's own failures (ADR 0008 decision 1): lease
+# recovery requeues the job while it has attempts left and fails it on the last one.
+RETRYABLE_CODES = [
+    FailureCode.HANDLER_ERROR,
+    FailureCode.HANDLER_TIMEOUT,
+    FailureCode.LEASE_EXPIRED,
+]
 PERMANENT_CODES = [code for code in FailureCode if code not in RETRYABLE_CODES]
 
 

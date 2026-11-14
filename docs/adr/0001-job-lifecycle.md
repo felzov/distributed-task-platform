@@ -1,6 +1,6 @@
 # ADR 0001 — Job lifecycle and state transitions
 
-- **Status:** Accepted (updated 2026-11-07, 2026-11-10)
+- **Status:** Accepted (updated 2026-11-07, 2026-11-10, 2026-11-13)
 - **Date:** 2026-10-24
 
 ## Context
@@ -100,6 +100,17 @@ and the provider records one notification per key. Fencing still rejects only da
 stale attempt still calls the provider, but its call and the newer attempt's are one
 notification (tested by running a newer attempt's handler after a stale one). A future handler
 whose receiver takes no key needs a decision of its own (ADR 0007, consequences).
+
+**Update 2026-11-13 (phase 8):** decision 8 is built (ADR 0008 decision 1). A sweep in the
+dispatcher process, every `recovery_interval_s`, takes `running` jobs whose lease expired, with
+`FOR UPDATE SKIP LOCKED`. With attempts left it moves them to `queued`, due at once, with
+`dispatched_at` and the lease cleared and `error_code = 'lease_expired'`; without, to `failed` with
+`lease_expired`. The same transaction closes the open attempt row. Its updates are fenced like a
+worker's finish (status, attempt number, and the expired lease) and join the transition matrix
+test, so a stale worker finishing after the sweep writes nothing. The consequence "until stale-job
+recovery exists, a job whose worker crashes stays `running`" no longer holds: such a job is back in
+`queued` at most `lease_duration_s + recovery_interval_s` (150 s by default) after its claim, if
+the sweep's batch reaches it.
 
 ## Consequences
 
