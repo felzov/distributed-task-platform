@@ -13,6 +13,8 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit, urlunsplit
 
+from tests.settings import HiddenUrl
+
 CHUNK_BYTES = 64 * 1024
 
 
@@ -38,14 +40,15 @@ class TcpProxy:
         port: int = self._server.sockets[0].getsockname()[1]
         return port
 
-    def url(self, upstream_url: str) -> str:
+    def url(self, upstream_url: str) -> HiddenUrl:
         """`upstream_url` with its host and port replaced by the proxy's; user, password, path
-        and query kept. Hidden from tracebacks, which would show the URL with its password."""
+        and query kept. Hidden from tracebacks, which would show the URL with its password, and
+        returned as a `HiddenUrl` for the same reason."""
         __tracebackhide__ = True
         parts = urlsplit(upstream_url)
         credentials, _, _ = parts.netloc.rpartition("@")
         netloc = f"{credentials}@127.0.0.1:{self.port}" if credentials else f"127.0.0.1:{self.port}"
-        return urlunsplit(parts._replace(netloc=netloc))
+        return HiddenUrl(urlunsplit(parts._replace(netloc=netloc)))
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._accept, "127.0.0.1", 0)

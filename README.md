@@ -423,10 +423,13 @@ logging.
 - uvicorn's access log records each request's raw path and query string, so job IDs, whatever a
   client sent in place of one and anything after a `?` end up in the log. Payloads never do: they
   travel only in request bodies.
-- When an integration test fails, pytest's report shows the test function's arguments, including
-  `TEST_DATABASE_URL` and `TEST_BROKER_URL` with their passwords. The tests keep the processes'
-  output and environment out of the report, but the test services should use throwaway passwords
-  (CI's are written in its workflow file).
+- When an integration test fails, pytest's report shows the test function's arguments (and, with
+  `--showlocals`, its locals). `TEST_DATABASE_URL`, `TEST_BROKER_URL` and the URLs the test
+  helpers derive from them show there as `<test URL, hidden>`, and the tests keep the processes'
+  output and environment out of the report. A failing comparison of a URL itself still prints
+  both values in pytest's diff. With `--showlocals`, a URL a test rebuilds as a plain string, or a
+  password it reads back (`get_secret_value()`, `urlsplit(url).password`), shows too. So the test
+  services should use throwaway passwords (CI's are written in its workflow file).
 - `/ready` requires the database revision to equal the code's exactly. During a rolling deploy,
   instances running the old code report not ready as soon as the new migration is applied. The MVP
   runs one instance and migrates before starting it.

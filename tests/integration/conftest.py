@@ -18,7 +18,12 @@ from task_platform.data.db import create_db_engine
 from task_platform.worker import process
 from tests.integration.broker import TestBrokerError, load_test_broker_url
 from tests.integration.database import TestDatabaseError, load_test_database_url
-from tests.settings import UNREACHABLE_DATABASE_URL, make_test_broker_settings, make_test_settings
+from tests.settings import (
+    UNREACHABLE_DATABASE_URL,
+    HiddenUrl,
+    make_test_broker_settings,
+    make_test_settings,
+)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 
@@ -32,9 +37,10 @@ def alembic_config(settings: Settings) -> Config:
 
 
 @pytest.fixture(scope="session")
-def test_database_url() -> str:
+def test_database_url() -> HiddenUrl:
+    # Hidden: pytest prints a failing test's arguments, and this one holds the password.
     try:
-        return load_test_database_url()
+        return HiddenUrl(load_test_database_url())
     except TestDatabaseError as exc:
         pytest.fail(str(exc), pytrace=False)
 
@@ -69,9 +75,10 @@ async def engine(migrated_database: None, test_settings: Settings) -> AsyncItera
 
 
 @pytest.fixture(scope="session")
-def test_broker_url() -> str:
+def test_broker_url() -> HiddenUrl:
+    # Hidden for the same reason as test_database_url.
     try:
-        return load_test_broker_url()
+        return HiddenUrl(load_test_broker_url())
     except TestBrokerError as exc:
         pytest.fail(str(exc), pytrace=False)
 
