@@ -13,6 +13,8 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit, urlunsplit
 
+from tests.settings import HiddenUrl
+
 CHUNK_BYTES = 64 * 1024
 
 
@@ -28,6 +30,9 @@ class TcpProxy:
         self._flowing.set()
         self._writers: set[asyncio.StreamWriter] = set()
         self._pipes: set[asyncio.Task[None]] = set()
+        # Chunks a client sent while frozen, held on their way upstream; each counted once. A
+        # cut drops them: they never reach the upstream.
+        self.held_upstream = 0
 
     @property
     def port(self) -> int:
@@ -35,13 +40,15 @@ class TcpProxy:
         port: int = self._server.sockets[0].getsockname()[1]
         return port
 
-    def url(self, upstream_url: str) -> str:
+    def url(self, upstream_url: str) -> HiddenUrl:
         """`upstream_url` with its host and port replaced by the proxy's; user, password, path
-        and query kept."""
+        and query kept. Hidden from tracebacks, which would show the URL with its password, and
+        returned as a `HiddenUrl` for the same reason."""
+        __tracebackhide__ = True
         parts = urlsplit(upstream_url)
         credentials, _, _ = parts.netloc.rpartition("@")
         netloc = f"{credentials}@127.0.0.1:{self.port}" if credentials else f"127.0.0.1:{self.port}"
-        return urlunsplit(parts._replace(netloc=netloc))
+        return HiddenUrl(urlunsplit(parts._replace(netloc=netloc)))
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._accept, "127.0.0.1", 0)
@@ -87,16 +94,23 @@ class TcpProxy:
             upstream_writer.transport.abort()
             return
         self._writers |= {writer, upstream_writer}
-        for source, target in ((reader, upstream_writer), (upstream_reader, writer)):
-            pipe = asyncio.create_task(self._pipe(source, target))
+        for source, target, to_upstream in (
+            (reader, upstream_writer, True),
+            (upstream_reader, writer, False),
+        ):
+            pipe = asyncio.create_task(self._pipe(source, target, to_upstream=to_upstream))
             self._pipes.add(pipe)
             pipe.add_done_callback(self._pipes.discard)
 
-    async def _pipe(self, source: asyncio.StreamReader, target: asyncio.StreamWriter) -> None:
+    async def _pipe(
+        self, source: asyncio.StreamReader, target: asyncio.StreamWriter, *, to_upstream: bool
+    ) -> None:
         # An aborted connection ends the pipe with ConnectionError, or with b"" at the other end.
         with contextlib.suppress(ConnectionError):
             while data := await source.read(CHUNK_BYTES):
                 # Frozen: the chunk is held, and TCP backpressure stops the sender after that.
+                if to_upstream and not self._flowing.is_set():
+                    self.held_upstream += 1
                 await self._flowing.wait()
                 if target.is_closing():
                     return
@@ -108,7 +122,9 @@ class TcpProxy:
 
 @asynccontextmanager
 async def running_proxy(upstream_url: str) -> AsyncIterator[TcpProxy]:
-    """A started proxy to the host and port of `upstream_url`, closed afterwards."""
+    """A started proxy to the host and port of `upstream_url`, closed afterwards. Hidden from
+    tracebacks, which would show the URL with its password."""
+    __tracebackhide__ = True
     parts = urlsplit(upstream_url)
     assert parts.hostname is not None and parts.port is not None, "the URL needs a host and port"
     proxy = TcpProxy(parts.hostname, parts.port)

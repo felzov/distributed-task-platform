@@ -18,7 +18,12 @@ from task_platform.data.db import create_db_engine
 from task_platform.worker import process
 from tests.integration.broker import TestBrokerError, load_test_broker_url
 from tests.integration.database import TestDatabaseError, load_test_database_url
-from tests.settings import UNREACHABLE_DATABASE_URL, make_test_broker_settings, make_test_settings
+from tests.settings import (
+    UNREACHABLE_DATABASE_URL,
+    HiddenUrl,
+    make_test_broker_settings,
+    make_test_settings,
+)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 
@@ -32,9 +37,10 @@ def alembic_config(settings: Settings) -> Config:
 
 
 @pytest.fixture(scope="session")
-def test_database_url() -> str:
+def test_database_url() -> HiddenUrl:
+    # Hidden: pytest prints a failing test's arguments, and this one holds the password.
     try:
-        return load_test_database_url()
+        return HiddenUrl(load_test_database_url())
     except TestDatabaseError as exc:
         pytest.fail(str(exc), pytrace=False)
 
@@ -60,14 +66,19 @@ async def engine(migrated_database: None, test_settings: Settings) -> AsyncItera
         # Left behind only if a run was killed inside test_command_timeout_also_bounds_commit; it
         # would make every later INSERT sleep 2 s at COMMIT.
         await connection.execute(text("DROP TRIGGER IF EXISTS test_slow_commit ON jobs"))
+        # The same for a run killed inside tests.integration.faults.paused_update: its lock died
+        # with that run's session, but every matching update would still take it in turn.
+        await connection.execute(text("DROP TRIGGER IF EXISTS test_paused_update ON jobs"))
+        await connection.execute(text("DROP FUNCTION IF EXISTS test_paused_update()"))
     yield engine
     await engine.dispose()
 
 
 @pytest.fixture(scope="session")
-def test_broker_url() -> str:
+def test_broker_url() -> HiddenUrl:
+    # Hidden for the same reason as test_database_url.
     try:
-        return load_test_broker_url()
+        return HiddenUrl(load_test_broker_url())
     except TestBrokerError as exc:
         pytest.fail(str(exc), pytrace=False)
 

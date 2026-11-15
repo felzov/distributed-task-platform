@@ -4,6 +4,20 @@ from urllib.parse import urlsplit, urlunsplit
 
 from task_platform.config import BrokerSettings, Settings
 
+
+class HiddenUrl(str):
+    """A test URL whose `repr` hides it: the test URLs hold their passwords. A failing test's
+    report shows the test's arguments, and with `--showlocals` the locals of the frames it shows,
+    each through `repr`. Not hidden: a failing `==` on the URL itself (pytest diffs the values),
+    and any `str` built from it, since `str` methods, slicing and `+` return a plain `str`. Its
+    value, `str()`, f-strings and comparisons are a plain `str`'s."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<test URL, hidden>"
+
+
 # A closed port: any database access fails at once with ConnectionRefusedError.
 UNREACHABLE_DATABASE_URL = "postgresql+asyncpg://task_platform:unused@127.0.0.1:1/unused_test"
 # The same for RabbitMQ: the first connection attempt fails at once.
@@ -34,11 +48,14 @@ def make_test_broker_settings(
     return BrokerSettings(_env_file=None, **values)
 
 
-def with_url_parts(url: str, *, password: str | None = None, path: str | None = None) -> str:
-    """`url` with its password or path (database, vhost) replaced; everything else kept."""
+def with_url_parts(url: str, *, password: str | None = None, path: str | None = None) -> HiddenUrl:
+    """`url` with its password or path (database, vhost) replaced; everything else kept. Hidden
+    like the fixtures' URLs: a changed path keeps the real password."""
     parts = urlsplit(url)
     netloc = parts.netloc
     if password is not None:
         _, _, host = netloc.rpartition("@")
         netloc = f"{parts.username}:{password}@{host}"
-    return urlunsplit(parts._replace(netloc=netloc, path=parts.path if path is None else path))
+    return HiddenUrl(
+        urlunsplit(parts._replace(netloc=netloc, path=parts.path if path is None else path))
+    )

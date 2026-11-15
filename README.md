@@ -88,7 +88,7 @@ The ADRs refer to these phases by number.
 6. Dead letters and failure inspection *(done)*
 7. Idempotency for submission and side effects *(done)*
 8. Graceful shutdown, stale-job and lost-message recovery, broker outages *(done)*
-9. Failure-path test suite
+9. Failure-path test suite *(done)*
 10. Documentation of delivery guarantees and operations
 
 ## Architecture decisions
@@ -387,7 +387,12 @@ logging.
   cancel is answered, the cancel is dropped and aiormq logs a WARNING "Closing channel … because
   RPC call Basic.Cancel cancelled" (harmless: a message delivered meanwhile goes back marked
   redelivered, not counted). After a second signal, SQLAlchemy can log "Exception closing
-  connection" with a traceback of the cancelled close.
+  connection" with a traceback of the cancelled close. When a test cut a running worker's broker
+  link, aiormq logged a WARNING "Cancelling cause reader exited abnormally" with a socket traceback
+  and aio-pika an `ERROR aio_pika.tools: Callback <… RobustChannel._on_close …> error:
+  RuntimeError: <Connection …> closed`. Both are harmless: the robust connection reconnects about
+  5 s later and restores its channel. They show the broker's user, host and port, with the
+  password masked (`docs/failure-modes.md`).
 - No constraint ties `result` and `error_code` to the status: `GET /jobs/{id}` derives both fields
   from the status alone, and only the worker's own updates keep the columns consistent. A
   `failed` row without an error code shows `failure: null`, and a code this version does not know
@@ -423,10 +428,13 @@ logging.
 - uvicorn's access log records each request's raw path and query string, so job IDs, whatever a
   client sent in place of one and anything after a `?` end up in the log. Payloads never do: they
   travel only in request bodies.
-- When an integration test fails, pytest's report shows the test function's arguments, including
-  `TEST_DATABASE_URL` and `TEST_BROKER_URL` with their passwords. The tests keep the processes'
-  output and environment out of the report, but the test services should use throwaway passwords
-  (CI's are written in its workflow file).
+- When an integration test fails, pytest's report shows the test function's arguments (and, with
+  `--showlocals`, its locals). `TEST_DATABASE_URL`, `TEST_BROKER_URL` and the URLs the test
+  helpers derive from them show there as `<test URL, hidden>`, and the tests keep the processes'
+  output and environment out of the report. A failing comparison of a URL itself still prints
+  both values in pytest's diff. With `--showlocals`, a URL a test rebuilds as a plain string, or a
+  password it reads back (`get_secret_value()`, `urlsplit(url).password`), shows too. So the test
+  services should use throwaway passwords (CI's are written in its workflow file).
 - `/ready` requires the database revision to equal the code's exactly. During a rolling deploy,
   instances running the old code report not ready as soon as the new migration is applied. The MVP
   runs one instance and migrates before starting it.
