@@ -10,6 +10,7 @@ import asyncio
 import json
 import re
 import signal
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -17,17 +18,19 @@ from urllib.parse import unquote, urlsplit
 
 import httpx
 import pytest
+from aio_pika import DeliveryMode, Message
 from aio_pika.abc import AbstractRobustConnection
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from task_platform.broker.topology import dead_letter_queue_name
 from task_platform.config import BrokerSettings
+from task_platform.domain.messages import encode_job_message
 from task_platform.main import create_app
 from tests.app_client import app_client
 from tests.integration.faults import paused_update
 from tests.integration.processes import assert_logged_times, assert_not_logged, child_process
-from tests.integration.rows import fake_notification_rows, fake_result
+from tests.integration.rows import fake_notification_rows, fake_result, insert_job
 from tests.proxy import TcpProxy, running_proxy
 from tests.settings import make_test_settings
 
@@ -98,9 +101,11 @@ async def ready_messages(connection: AbstractRobustConnection, queue: str) -> in
     return (await queue_counts(connection, queue))[0]
 
 
-async def wait_for_ready(connection: AbstractRobustConnection, queue: str, count: int) -> None:
-    """Until the queue holds exactly `count` ready messages. Bounded: a message given back by a
-    closed connection is counted ~0.1 s later (phase 8, R9)."""
+async def wait_for_ready(
+    connection: AbstractRobustConnection, queue: str, count: int, what: str = "the queue"
+) -> None:
+    """Until `queue` holds exactly `count` ready messages; `what` names it in a failure. Bounded:
+    a message given back by a closed connection is counted ~0.1 s later (phase 8, R9)."""
     __tracebackhide__ = True
     found = None
     try:
@@ -108,15 +113,18 @@ async def wait_for_ready(connection: AbstractRobustConnection, queue: str, count
             while (found := await ready_messages(connection, queue)) != count:
                 await asyncio.sleep(0.02)
     except TimeoutError:
-        raise AssertionError(f"{found} ready messages in the queue, expected {count}") from None
+        raise AssertionError(f"{found} ready messages in {what}, expected {count}") from None
 
 
-async def assert_drained(connection: AbstractRobustConnection, queue: str) -> None:
-    """Every message answered: no consumer left, and the jobs queue and its dead-letter queue
-    stay empty. An empty read alone proves nothing: a message nobody answered comes back only when
-    its consumer's connection closes, and is counted ~0.1 s later (R9); a quorum queue keeps
-    counting a consumer until its held message is answered (phase 8). So first no consumer, then
-    0.5 s of empty reads. Fails naming counts only."""
+async def assert_drained(
+    connection: AbstractRobustConnection, queue: str, dead_lettered: int = 0
+) -> None:
+    """Every message answered: no consumer left, the jobs queue empty and exactly `dead_lettered`
+    messages in its dead-letter queue, for 0.5 s. An empty read alone proves nothing: a message
+    nobody answered comes back only when its consumer's connection closes, and is counted ~0.1 s
+    later (R9); a quorum queue keeps counting a consumer until its held message is answered
+    (phase 8). So first no consumer, then the dead letters, then 0.5 s of steady reads. Fails
+    naming counts only."""
     __tracebackhide__ = True
     dead_letters = dead_letter_queue_name(queue)
     counts = None
@@ -126,6 +134,7 @@ async def assert_drained(connection: AbstractRobustConnection, queue: str) -> No
                 await asyncio.sleep(0.02)
     except TimeoutError:
         raise AssertionError(f"(ready, consumers) {counts}: a consumer is left") from None
+    await wait_for_ready(connection, dead_letters, dead_lettered, "the dead-letter queue")
     loop = asyncio.get_running_loop()
     until = loop.time() + 0.5
     while loop.time() < until:
@@ -133,7 +142,9 @@ async def assert_drained(connection: AbstractRobustConnection, queue: str) -> No
             await ready_messages(connection, queue),
             await ready_messages(connection, dead_letters),
         )
-        assert (ready, dead) == (0, 0), f"{ready} ready, {dead} dead-lettered, expected none"
+        assert (ready, dead) == (0, dead_lettered), (
+            f"{ready} ready, {dead} dead-lettered, expected 0 and {dead_lettered}"
+        )
         await asyncio.sleep(0.05)
 
 
@@ -409,7 +420,7 @@ BROKER_CUT_RECORDS = (
 
 async def wait_for_held_ack(proxy: TcpProxy) -> None:
     """Until the proxy holds a chunk from the worker: its ack, the only thing it sends between
-    the final update and the cut (its heartbeat comes every 60 s)."""
+    the final update and the cut (aiormq sends a heartbeat every half of the 60 s timeout, 30 s)."""
     __tracebackhide__ = True
     try:
         async with asyncio.timeout(5):
@@ -485,4 +496,172 @@ async def test_an_ack_lost_on_a_broker_cut_brings_the_message_back_and_the_claim
         assert password, "a test URL without a password to look for"
         assert_not_logged(bytes(worker_log), unquote(password).encode())
     for body in (status_response.content, attempts_response.content):
+        assert_not_logged(body, SENTINEL.encode())
+
+
+# Poison and valid messages mixed, with two workers consuming (criterion 5)
+
+UNPARSABLE = f'{{"message_version": 1, "job_id": "{SENTINEL}"'.encode()
+REJECTED = b"rejected an unparsable message"
+UNKNOWN_JOB = b": unknown job "
+
+
+async def publish(connection: AbstractRobustConnection, queue: str, body: bytes) -> None:
+    """A persistent message to the queue by the default exchange, as the dispatcher sends one but
+    without its publisher confirms or `mandatory` flag: the queue exists, so nothing is lost."""
+    async with connection.channel() as channel:
+        await channel.default_exchange.publish(
+            Message(body, delivery_mode=DeliveryMode.PERSISTENT), routing_key=queue
+        )
+
+
+async def dead_letter_bodies(connection: AbstractRobustConnection, queue: str) -> list[bytes]:
+    """The dead-letter queue's messages, taken off it. Call it after `assert_drained`: before,
+    a message on its way to the dead-letter queue could still be missing."""
+    bodies = []
+    async with connection.channel() as channel:
+        dead_letters = await channel.declare_queue(dead_letter_queue_name(queue), passive=True)
+        while (message := await dead_letters.get(no_ack=True, fail=False)) is not None:
+            bodies.append(message.body)
+    return bodies
+
+
+async def wait_for_total(
+    workers: Sequence[tuple[asyncio.subprocess.Process, bytearray]], line: bytes, count: int
+) -> None:
+    """Until the workers together have logged `line` `count` times; fails at once if one exited.
+    Fails without showing their output."""
+    __tracebackhide__ = True
+    found = 0
+    try:
+        async with asyncio.timeout(15):
+            while (found := sum(bytes(log).count(line) for _, log in workers)) < count:
+                exited = [child.returncode for child, _ in workers if child.returncode is not None]
+                assert not exited, f"a worker exited with status {exited[0]} before {line!r}"
+                await asyncio.sleep(0.02)
+    except TimeoutError:
+        raise AssertionError(f"{line!r} logged {found} times in all, expected {count}") from None
+
+
+async def wait_for_consumers(connection: AbstractRobustConnection, queue: str, count: int) -> None:
+    """Until `queue` has exactly `count` consumers; it must exist already."""
+    __tracebackhide__ = True
+    found = None
+    try:
+        async with asyncio.timeout(5):
+            while (found := (await queue_counts(connection, queue))[1]) != count:
+                await asyncio.sleep(0.02)
+    except TimeoutError:
+        raise AssertionError(f"{found} consumers on the queue, expected {count}") from None
+
+
+POISON_ANSWERS = (REJECTED, UNKNOWN_JOB, NOT_CLAIMED)
+
+
+async def test_poison_messages_mixed_with_valid_ones_leave_two_workers_running(
+    engine: AsyncEngine,
+    broker_connection: AbstractRobustConnection,
+    broker_settings: BrokerSettings,
+    env: ChildEnv,
+) -> None:
+    queue = broker_settings.jobs_queue_name
+    async with app_client(create_app(make_test_settings(env["DATABASE_URL"]))) as client:
+        valid = [(await client.post("/jobs", json=JOB)).json()["id"] for _ in range(3)]
+        # A payload the API would refuse, stored anyway (written before a schema change, say):
+        # no subject or body. Attempts left, so only the failure's kind keeps it from a retry.
+        invalid = str(
+            (
+                await insert_job(
+                    engine,
+                    payload=json.dumps({"recipient": f"{SENTINEL}@example.com"}),
+                    max_attempts=3,
+                )
+            )["id"]
+        )
+        unknown = uuid.uuid4()
+        poison = {
+            # Cut off mid-object, quoting the sentinel: the worker must not echo it.
+            "unparsable": UNPARSABLE,
+            # A version the worker does not know, for a real job: it must not run that job.
+            "wrong-version": json.dumps({"message_version": 2, "job_id": valid[1]}).encode(),
+            "unknown-job": encode_job_message(unknown),
+            # A second message for valid[0], published after the dispatcher's: a claim takes any
+            # queued job, so published first it would run the job before the dispatcher's poll.
+            "duplicate": encode_job_message(uuid.UUID(valid[0])),
+        }
+        async with (
+            child_process(WORKER, env) as first,
+            child_process(WORKER, env) as second,
+        ):
+            workers = (first, second)
+            # Both consume before any message exists. With a prefetch of 1 each, the quorum
+            # queue hands messages to its consumers in turn, so each worker gets some of the mix.
+            for child, log in workers:
+                await wait_for_output(child, log, b"worker started: queue")
+            await wait_for_consumers(broker_connection, queue, 2)
+            for label in ("unparsable", "wrong-version", "unknown-job"):
+                await publish(broker_connection, queue, poison[label])
+            async with child_process(DISPATCHER, env) as (dispatcher, dispatcher_log):
+                # All four jobs were due before the dispatcher started: one poll publishes them.
+                await wait_for_output(dispatcher, dispatcher_log, b"dispatched 4 of 4 due jobs")
+                await publish(broker_connection, queue, poison["duplicate"])
+                statuses = [await wait_until(client, job_id, "succeeded") for job_id in valid]
+                failed = await wait_until(client, invalid, "failed")
+                await wait_for_total(workers, REJECTED, 2)
+                await wait_for_total(workers, UNKNOWN_JOB, 1)
+                await wait_for_total(workers, NOT_CLAIMED, 1)
+                assert await stop(dispatcher) == 0
+            # Both still running after the whole mix, and both stop cleanly.
+            assert [child.returncode for child, _ in workers] == [None, None]
+            assert [await stop(child) for child, _ in workers] == [0, 0]
+        attempts_responses = {
+            job_id: await client.get(f"/jobs/{job_id}/attempts") for job_id in [*valid, invalid]
+        }
+
+    attempts = {
+        job_id: [
+            (a["attempt"], a["outcome"], a["failure"] and a["failure"]["code"])
+            for a in response.json()["attempts"]
+        ]
+        for job_id, response in attempts_responses.items()
+    }
+    # Each valid job ran once, with one notification, whatever the duplicate and the wrong-version
+    # message pointed at.
+    for job_id, status in zip(valid, statuses, strict=True):
+        assert attempts[job_id] == [(1, "succeeded", None)]
+        [notification] = await fake_notification_rows(engine, job_id)
+        assert status["result"] == fake_result(notification)
+    # The stored invalid payload failed on its first attempt, not retried, nothing sent.
+    assert (failed["attempts"], failed["failure"]["code"]) == (1, "invalid_payload")
+    assert attempts[invalid] == [(1, "failed", "invalid_payload")]
+    assert await fake_notification_rows(engine, invalid) == []
+    # The two messages the worker cannot read are dead-lettered, untouched; the unknown job and
+    # the duplicate were acked. Compared by label: a failing compare of the bodies would print
+    # the sentinel.
+    await assert_drained(broker_connection, queue, dead_lettered=2)
+    dead_lettered = sorted(
+        next((label for label, body in poison.items() if body == dead), "something else")
+        for dead in await dead_letter_bodies(broker_connection, queue)
+    )
+    assert dead_lettered == ["unparsable", "wrong-version"]
+    # The dispatcher published only the four jobs.
+    assert_logged_times(bytes(dispatcher_log), b"dispatched", 1)
+    # Each answered once, in all: a poison message requeued instead would be dead-lettered too,
+    # but only after the queue's delivery limit, logged once per delivery.
+    both = bytes(first[1]) + bytes(second[1])
+    assert_logged_times(both, REJECTED, 2)
+    assert_logged_times(both, f"unknown job {unknown}".encode(), 1)
+    assert_logged_times(both, UNKNOWN_JOB, 1)
+    assert_logged_times(both, f"job {valid[0]} not claimed".encode(), 1)
+    assert_logged_times(both, NOT_CLAIMED, 1)
+    # Each worker answered part of the mix itself, so "still running" holds for both.
+    for index, (_, log) in enumerate(workers):
+        answered = sum(bytes(log).count(line) for line in POISON_ANSWERS)
+        assert answered >= 1, f"worker {index} answered none of the poison messages"
+    for log in (dispatcher_log, first[1], second[1]):
+        assert_clean(bytes(log))
+    for body in [
+        *(json.dumps(status).encode() for status in [*statuses, failed]),
+        *(response.content for response in attempts_responses.values()),
+    ]:
         assert_not_logged(body, SENTINEL.encode())
