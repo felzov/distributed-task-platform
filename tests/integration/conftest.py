@@ -60,6 +60,10 @@ async def engine(migrated_database: None, test_settings: Settings) -> AsyncItera
         # Left behind only if a run was killed inside test_command_timeout_also_bounds_commit; it
         # would make every later INSERT sleep 2 s at COMMIT.
         await connection.execute(text("DROP TRIGGER IF EXISTS test_slow_commit ON jobs"))
+        # The same for a run killed inside tests.integration.faults.paused_update: its lock died
+        # with that run's session, but every matching update would still take it in turn.
+        await connection.execute(text("DROP TRIGGER IF EXISTS test_paused_update ON jobs"))
+        await connection.execute(text("DROP FUNCTION IF EXISTS test_paused_update()"))
     yield engine
     await engine.dispose()
 
