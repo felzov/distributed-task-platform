@@ -88,7 +88,7 @@ The ADRs refer to these phases by number.
 6. Dead letters and failure inspection *(done)*
 7. Idempotency for submission and side effects *(done)*
 8. Graceful shutdown, stale-job and lost-message recovery, broker outages *(done)*
-9. Failure-path test suite
+9. Failure-path test suite *(done)*
 10. Documentation of delivery guarantees and operations
 
 ## Architecture decisions
@@ -387,7 +387,12 @@ logging.
   cancel is answered, the cancel is dropped and aiormq logs a WARNING "Closing channel … because
   RPC call Basic.Cancel cancelled" (harmless: a message delivered meanwhile goes back marked
   redelivered, not counted). After a second signal, SQLAlchemy can log "Exception closing
-  connection" with a traceback of the cancelled close.
+  connection" with a traceback of the cancelled close. When a test cut a running worker's broker
+  link, aiormq logged a WARNING "Cancelling cause reader exited abnormally" with a socket traceback
+  and aio-pika an `ERROR aio_pika.tools: Callback <… RobustChannel._on_close …> error:
+  RuntimeError: <Connection …> closed`. Both are harmless: the robust connection reconnects about
+  5 s later and restores its channel. They show the broker's user, host and port, with the
+  password masked (`docs/failure-modes.md`).
 - No constraint ties `result` and `error_code` to the status: `GET /jobs/{id}` derives both fields
   from the status alone, and only the worker's own updates keep the columns consistent. A
   `failed` row without an error code shows `failure: null`, and a code this version does not know
