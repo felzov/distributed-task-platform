@@ -89,6 +89,27 @@ async def test_a_freeze_holds_bytes_on_an_open_connection_until_restored(proxy: 
     writer.close()
 
 
+async def test_a_chunk_held_by_a_freeze_is_counted_and_a_cut_drops_it(proxy: TcpProxy) -> None:
+    reader, writer = await connect(proxy)
+    assert await round_trip(reader, writer) == b"ping"
+    assert proxy.held_upstream == 0
+    proxy.freeze()
+    writer.write(b"lost")
+    await writer.drain()
+    async with asyncio.timeout(1):
+        while proxy.held_upstream != 1:
+            await asyncio.sleep(0.01)
+
+    proxy.cut()
+    proxy.restore()
+    # The held chunk never reached the echo server: nothing comes back before the reset.
+    assert await closed_by_peer(reader)
+    assert proxy.held_upstream == 1
+    reader, writer = await connect(proxy)
+    assert await round_trip(reader, writer) == b"ping"
+    writer.close()
+
+
 def test_url_points_at_the_proxy_and_keeps_the_rest(proxy: TcpProxy) -> None:
     url = "postgresql+asyncpg://user:pa%40ss@db.example:5432/jobs_test?ssl=disable"
     assert proxy.url(url) == (

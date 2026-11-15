@@ -3,14 +3,17 @@
 A process killed with SIGKILL runs none of its own code on the way out: no `finally`, no nack, no
 rollback, no connection close. The broker returns its unacknowledged messages when the socket
 closes, and the database keeps whatever the process had committed. Each crash is placed exactly
-with `tests.integration.faults.paused_update`, never with a sleep.
+with `tests.integration.faults.paused_update`, never with a sleep; a lost ack, with the TCP proxy.
 """
 
 import asyncio
 import json
 import re
 import signal
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 import httpx
 import pytest
@@ -25,6 +28,7 @@ from tests.app_client import app_client
 from tests.integration.faults import paused_update
 from tests.integration.processes import assert_logged_times, assert_not_logged, child_process
 from tests.integration.rows import fake_notification_rows, fake_result
+from tests.proxy import TcpProxy, running_proxy
 from tests.settings import make_test_settings
 
 pytestmark = pytest.mark.integration
@@ -199,10 +203,25 @@ def _records(stderr: bytes) -> list[tuple[bytes, bytes, bytes]]:
     return records
 
 
-def assert_clean(stderr: bytes) -> None:
-    """No payload, no ERROR or CRITICAL record and no traceback in a child's log, and no
-    unhandled-error output. Fails closed: an " ERROR " the header pattern does not parse fails
-    too. Names levels and loggers only, never a line."""
+@dataclass(frozen=True)
+class KnownRecord:
+    """A library's log record a test expects: allowed even as an ERROR or with a traceback."""
+
+    level: bytes
+    logger: bytes
+    # Every one must be in the record's text: an allowance for one record, not a whole logger.
+    markers: tuple[bytes, ...]
+
+    def matches(self, level: bytes, logger: bytes, body: bytes) -> bool:
+        return (level, logger) == (self.level, self.logger) and all(
+            marker in body for marker in self.markers
+        )
+
+
+def assert_clean(stderr: bytes, *, known: Sequence[KnownRecord] = ()) -> None:
+    """No payload, no ERROR or CRITICAL record and no traceback in a child's log, except the
+    `known` records, and no unhandled-error output. Fails closed: an " ERROR " the header pattern
+    does not parse fails too. Names levels and loggers only, never a line."""
     __tracebackhide__ = True
     assert_not_logged(stderr, SENTINEL.encode())
     for unhandled in _UNHANDLED:
@@ -215,7 +234,8 @@ def assert_clean(stderr: bytes) -> None:
         {
             (level.decode(), logger.decode())
             for level, logger, body in records
-            if level in {b"ERROR", b"CRITICAL"} or b"Traceback" in body
+            if (level in {b"ERROR", b"CRITICAL"} or b"Traceback" in body)
+            and not any(record.matches(level, logger, body) for record in known)
         }
     )
     assert not unexpected, f"(level, logger) records with an error in the child's log: {unexpected}"
@@ -370,4 +390,99 @@ async def test_a_dispatcher_killed_before_its_commit_publishes_again_and_the_job
     for log in (first_log, second_log, worker_log):
         assert_clean(bytes(log))
     for body in (json.dumps(status).encode(), attempts_response.content):
+        assert_not_logged(body, SENTINEL.encode())
+
+
+# An ack lost on a broker cut, after the job's final update committed (criterion 4)
+
+# What a worker logs when its broker link is cut (aio-pika 10.2.1, aiormq 7.2.4): aiormq a WARNING
+# with the dropped socket's traceback, and aio-pika an ERROR from RobustChannel._on_close, whose
+# restore finds the connection closed ("RuntimeError: <Connection ...> closed", the password
+# masked). The robust connection then reconnects and restores the channel itself.
+BROKER_CUT_RECORDS = (
+    KnownRecord(b"WARNING", b"aiormq.connection", (b"Cancelling cause reader exited abnormally",)),
+    KnownRecord(
+        b"ERROR", b"aio_pika.tools", (b"RobustChannel._on_close", b"error: RuntimeError: ")
+    ),
+)
+
+
+async def wait_for_held_ack(proxy: TcpProxy) -> None:
+    """Until the proxy holds a chunk from the worker: its ack, the only thing it sends between
+    the final update and the cut (its heartbeat comes every 60 s)."""
+    __tracebackhide__ = True
+    try:
+        async with asyncio.timeout(5):
+            while proxy.held_upstream < 1:
+                await asyncio.sleep(0.01)
+    except TimeoutError:
+        raise AssertionError("the worker sent nothing into the frozen link") from None
+
+
+async def test_an_ack_lost_on_a_broker_cut_brings_the_message_back_and_the_claim_refuses_it(
+    engine: AsyncEngine,
+    broker_connection: AbstractRobustConnection,
+    broker_settings: BrokerSettings,
+    env: ChildEnv,
+) -> None:
+    queue = broker_settings.jobs_queue_name
+    async with (
+        app_client(create_app(make_test_settings(env["DATABASE_URL"]))) as client,
+        running_proxy(env["BROKER_URL"]) as proxy,
+    ):
+        job_id = (await client.post("/jobs", json=JOB)).json()["id"]
+        # Only the worker reaches the broker through the proxy. If aio-pika's own channel restore
+        # failed, the worker would consume again by itself, after STARTUP_RETRY_INTERVAL_S (ADR
+        # 0008 decision 8): short, so either path ends well within the test's waits.
+        worker_env = ChildEnv(
+            {
+                **env,
+                "BROKER_URL": proxy.url(env["BROKER_URL"]),
+                "STARTUP_RETRY_INTERVAL_S": "0.2",
+            }
+        )
+        async with child_process(DISPATCHER, env) as (dispatcher, dispatcher_log):
+            async with child_process(WORKER, worker_env) as (worker, worker_log):
+                async with paused_update(engine, FINISH_SUCCEEDED) as pause:
+                    await pause.wait_for_pause(child=worker)
+                    # Frozen before the final update goes on: the ack that follows its commit
+                    # is held by the proxy, and the cut drops it. It never reaches the broker.
+                    proxy.freeze()
+                    await pause.release()
+                    await wait_until(client, job_id, "succeeded")
+                    await wait_for_held_ack(proxy)
+                # The broker sees the connection drop and returns the unacked message, counted.
+                # The worker's robust connection comes back through the restored proxy (aio-pika
+                # waits 5 s before reconnecting) and is given the message again.
+                proxy.cut()
+                proxy.restore()
+                await wait_for_output(worker, worker_log, NOT_CLAIMED)
+                assert await stop(worker) == 0
+            assert await stop(dispatcher) == 0
+        status_response = await client.get(f"/jobs/{job_id}")
+        attempts_response = await client.get(f"/jobs/{job_id}/attempts")
+
+    status = status_response.json()
+    attempts = [
+        (a["attempt"], a["outcome"], a["failure"]) for a in attempts_response.json()["attempts"]
+    ]
+    assert attempts == [(1, "succeeded", None)]
+    assert (status["status"], status["attempts"]) == ("succeeded", 1)
+    [notification] = await fake_notification_rows(engine, job_id)
+    assert status["result"] == fake_result(notification)
+    # Published once: the redelivery came from the broker, not from a second publish.
+    assert_logged_times(bytes(dispatcher_log), DISPATCHED, 1)
+    assert_logged_times(bytes(worker_log), NOT_CLAIMED, 1)
+    # The ack itself went out and was lost on the way: the worker never saw it fail.
+    assert_not_logged(bytes(worker_log), b"could not ack")
+    await assert_drained(broker_connection, queue)
+    assert_clean(bytes(dispatcher_log))
+    # Nothing of the worker's own is an ERROR; only the cut's two known library records.
+    assert_clean(bytes(worker_log), known=BROKER_CUT_RECORDS)
+    # Those lines print the connection: user, host and port, the password masked.
+    for url in (env["DATABASE_URL"], env["BROKER_URL"]):
+        password = urlsplit(url).password
+        assert password, "a test URL without a password to look for"
+        assert_not_logged(bytes(worker_log), unquote(password).encode())
+    for body in (status_response.content, attempts_response.content):
         assert_not_logged(body, SENTINEL.encode())
