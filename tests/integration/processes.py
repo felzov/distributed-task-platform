@@ -78,6 +78,14 @@ def assert_not_logged(stderr: bytes, text: bytes) -> None:
     assert not found, "the child's stderr holds text it must not hold"
 
 
+def assert_logged_times(stderr: bytes, text: bytes, times: int) -> None:
+    """As `assert_logged`, for an exact count. Fails naming `text` and the counts only: pytest
+    would show the log in a failing `stderr.count(...) == n`."""
+    __tracebackhide__ = True
+    found = stderr.count(text)
+    assert found == times, f"{text!r} logged {found} times, expected {times}"
+
+
 async def run_to_exit(module: str, env: dict[str, str]) -> tuple[int, bytes]:
     """Start the module and return its exit status and stderr; killed after 15 s."""
     __tracebackhide__ = True
