@@ -52,7 +52,7 @@ The diagram and the bullets describe the design; the last bullet says what runs 
   the provider (one notification), and a job that always fails to `failed` after its last attempt,
   where the failed-jobs list shows it. The dispatcher also recovers jobs whose worker crashed and
   jobs whose message was lost; both processes stop gracefully on a signal, wait for the database
-  and the broker at start, and survive broker outages (see Recovery, shutdown and outages).
+  and the broker at start, and survive broker outages (see [docs/operations.md](docs/operations.md)).
 
 ## MVP scope
 
@@ -203,108 +203,11 @@ lists every failed job that existed when the walk began exactly once, even while
 cursor the API did not make gets `422 invalid_request`. Migration 0004 adds the index the list
 reads.
 
-## Dead letters
+## Operations
 
-A job that failed for good is its `failed` row in PostgreSQL, readable over the API. A **message**
-the worker can never process is kept on RabbitMQ instead of being dropped
-([ADR 0006](docs/adr/0006-dead-letters.md)). It goes to the dead-letter queue
-`<JOBS_QUEUE_NAME>.dead` (`jobs.dead` by default) when:
-
-- it cannot be parsed (the worker rejects it), with reason `rejected`;
-- it is returned to the queue more than 20 times (`x-delivery-limit`): requeued with `reject` after
-  a bug in its handling, or left unacknowledged when its worker dies, with reason `delivery_limit`.
-
-A database outage never sends a message there: the worker answers it with `nack`, which RabbitMQ
-does not count. Nothing reads the dead-letter queue and it never changes a job: a job whose message
-died is taken on by recovery instead (see Recovery, shutdown and outages), so a dead letter does
-not mean its job is stuck. To see how many messages it holds:
-
-```bash
-docker compose exec rabbitmq rabbitmqctl list_queues name messages
-```
-
-A message's body is `{"message_version": 1, "job_id": "…"}`, which names its job, and its
-`x-death` header says from which queue and why. The project has no tool to show a body yet.
-
-**Upgrading from phase 5.** The jobs queue's arguments are fixed when RabbitMQ creates it, so a
-`jobs` queue created by an earlier version makes the dispatcher and the worker stop at start with
-`PRECONDITION_FAILED`. Recreate it once: stop the dispatcher; let the workers empty the queue, then
-stop them (a running worker would declare a deleted queue again, with the old arguments); run
-`docker compose exec rabbitmq rabbitmqctl delete_queue jobs --if-empty --if-unused`; start the new
-version.
-
-## Recovery, shutdown and outages
-
-The dispatcher runs two recovery sweeps every `RECOVERY_INTERVAL_S` (30 s), next to its polls
-([ADR 0008](docs/adr/0008-recovery-and-shutdown.md)):
-
-- **Expired leases.** A job still `running` after its lease (`LEASE_DURATION_S`, 120 s) expired
-  belonged to a worker that crashed or was stopped too soon. With attempts left it goes back to
-  `queued`, due at once, without backoff; otherwise it fails. Either way its open attempt is closed
-  as `failed` with `lease_expired`, in the same transaction. A worker that finishes after the
-  sweep writes nothing: its result is rejected like any stale one.
-- **Lost messages.** A job `queued` and published more than `LOST_MESSAGE_AFTER_S` (600 s) ago
-  whose message never led to a claim (lost, dead-lettered, or rejected at the claim) is marked
-  unpublished, and the next poll publishes it again. The sweep runs only while the jobs queue has
-  no ready messages, so a message that is only waiting in a backlog is not published twice. While
-  the broker is unreachable it is skipped; the lease sweep needs only the database and still
-  runs.
-
-Both sweeps take at most `DISPATCH_BATCH_SIZE` jobs per pass with `FOR UPDATE SKIP LOCKED`, so
-several dispatchers can run them without recovering a job twice.
-
-**Stopping.** On SIGTERM or SIGINT (Ctrl-C):
-
-- the worker cancels its consumer, lets the job in hand finish and be acked for up to
-  `SHUTDOWN_GRACE_S` (30 s), and exits with status 0. Past that, the job is cancelled: its message
-  goes back to the queue and lease recovery takes the job on, which uses up the attempt;
-- the dispatcher lets the poll and the recovery pass in hand commit, starts no new ones, and exits
-  with status 0.
-
-A second signal stops either one within a few seconds: it cancels the work in hand (a dispatcher's
-open transaction rolls back, and its confirmed publishes are repeated on the next start), and each
-connection's close is bounded by `BROKER_CONNECT_TIMEOUT_S` and `DB_CONNECT_TIMEOUT_S`. Docker
-waits 10 s between SIGTERM and SIGKILL by default, less than the 30 s grace: give `docker stop` a
-longer `-t`.
-
-**Starting.** Both processes first check that the database is at exactly this code's migration
-revision, as `/ready` does, then connect to RabbitMQ:
-
-- a database that is unreachable, starting up or out of connections, and a broker that is
-  unreachable, are waited for: a warning, then another try every `STARTUP_RETRY_INTERVAL_S` (5 s)
-  until it works or a signal comes;
-- a configuration error stops the process with an ERROR and exit status 1: another migration
-  revision (both are named), a wrong password, an unknown database or vhost, a missing privilege,
-  a malformed URL.
-
-**While running.** The API never talks to RabbitMQ, so a broker outage never fails a submission:
-jobs wait in `queued` and are published once the broker is back. The dispatcher and the worker
-reconnect by themselves. If the worker's consumer ends or the broker fails it, the worker
-consumes again on a new channel every `STARTUP_RETRY_INTERVAL_S` until that works; only a queue
-the broker refuses to declare stops it. The tests cut and freeze connections through a small TCP
-proxy instead of stopping the shared containers.
-
-**Logs.** The dispatcher and the worker log one line per event to stderr, with time, level and
-logger, at `LOG_LEVEL` (`INFO` by default; `DEBUG`, `INFO` or `WARNING`). SQLAlchemy's
-engine stays at WARNING whatever the level, since at DEBUG it would log result rows, payloads
-included. Errors are logged by class and SQLSTATE, never their text. The API keeps uvicorn's
-logging.
-
-## Health and readiness probes
-
-- `GET /health` is liveness: it returns `200 {"status": "ok"}` whenever the process answers and
-  touches no dependency, so a liveness check on it never restarts the API because of a database
-  outage.
-- `GET /ready` returns `200 {"status": "ready"}` when PostgreSQL answers and its migration revision
-  is exactly the one this code expects. Otherwise it returns `503 service_unavailable` with
-  `details` naming the failed check, `["database"]` or `["migrations"]`, never an error text or a
-  revision id. The whole check is bounded by `READY_CHECK_TIMEOUT_S`.
-- `/ready` does **not** check RabbitMQ. The API never talks to the broker: it only saves jobs, and
-  a dispatcher publishes them (ADR 0002). An instance that can save jobs must keep accepting them
-  during a broker outage.
-- `/ready` takes its connection from the API's own pool, so it reports whether a request could get
-  a connection right now, not only whether PostgreSQL is up. A full pool therefore fails `/ready`
-  with `["database"]` even when PostgreSQL is fine, which takes a busy instance out of rotation.
+Running several workers, configuration, migrations, failed jobs and the dead-letter queue,
+recovery, stopping, outages, logs and the health and readiness probes are in
+[docs/operations.md](docs/operations.md).
 
 ## Known limitations
 
@@ -356,16 +259,9 @@ make down                     # stop both; the data volumes are kept
   queues with unique names and delete only those and their `.dead` queues, so they can share the
   local RabbitMQ.
 - The dispatcher and the worker exit with status 1 at start if the development database is not
-  at this code's migration revision (run `make db-migrate`), and wait while PostgreSQL or RabbitMQ
-  is unreachable (see Recovery, shutdown and outages). Ctrl-C stops them gracefully; a second
-  Ctrl-C stops them within a few seconds.
-- A running dispatcher logs each poll that found due jobs, with how many it published, and each
-  job it recovered; a database outage only fails polls and sweeps, and the next one tries again.
-- While the database is down the worker gives each message back (`nack`) after
-  `WORKER_DB_ERROR_BACKOFF_S`, so no message is lost; its warnings name the job ID and error
-  class, never the payload. The worker stops at start if the queue cannot be declared, for example
-  a `jobs` queue from before phase 6 (see Dead letters, "Upgrading from phase 5"). Several workers
-  can run at once: the claim lets only one of them run a job.
+  at this code's migration revision (run `make db-migrate`). Ctrl-C stops them gracefully; a
+  second Ctrl-C stops them within a few seconds. Several workers can run at once. How they start,
+  stop, recover and log: [docs/operations.md](docs/operations.md).
 - Migrations are written by hand, never autogenerated:
   `make db-revision id=0002 m="what it does"` creates an empty revision to fill in.
 
