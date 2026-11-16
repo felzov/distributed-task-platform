@@ -4,22 +4,20 @@ A background-job system built to make failure behaviour explicit: an HTTP API sa
 PostgreSQL, a dispatcher publishes them to RabbitMQ, and separate workers run them with bounded
 retries, so slow work stays out of the request path and every failure is recorded.
 
-> **Status: early development (phase 8 of 10).** So far there are the domain rules, a local
-> PostgreSQL with migrations for the `jobs` table (including the lease, error and result columns
-> the worker writes), the `job_attempts` table and the fake provider's `fake_notifications` table,
-> `POST /jobs` (validates and saves a job, safe to retry with an `Idempotency-Key`; 503 when the
-> database is unavailable), `GET /jobs/{id}`
-> (a job's state, result or failure, never its payload), `GET /jobs/{id}/attempts` (each recorded
-> attempt and how it ended), `GET /jobs?status=failed` (failed jobs, newest first), the `/health`
-> and `/ready` probes, a local RabbitMQ with the connection, queue, dead-letter queue and
-> confirmed-publish code, the dispatcher process that publishes saved jobs
-> to it, the worker process that claims each job, runs it against a fake notification provider
-> (one notification per job, however often its handler runs), records the result and retries the
-> handler's own failures with backoff, recovery of crashed workers' jobs and of lost messages,
-> graceful shutdown, waiting out outages at start and while running, and the development checks
-> (see Development setup).
-> Architecture says which parts of the design run today; MVP scope and the roadmap describe the
-> planned design; Known limitations covers both.
+> **Status: all ten planned phases are done.** A portfolio project that runs on one machine
+> with Docker Compose. It has not been used in production or load-tested, and it has no
+> authentication. It has one job type, `notification.send`, whose provider is a fake that records
+> each notification in PostgreSQL.
+
+## Documentation
+
+| Page | What it covers |
+|------|----------------|
+| [Delivery guarantees](docs/delivery-guarantees.md) | What a `202` means, what is and is not guaranteed, and the tests behind each promise |
+| [Failure modes](docs/failure-modes.md) | Each failure path (duplicates, crashes, retry exhaustion, bad input, outages, stuck jobs), what happens, and its tests |
+| [Operations](docs/operations.md) | Running, configuring, stopping and watching the processes; recovery, dead letters, logs, probes |
+| [Known limitations](docs/limitations.md) | Everything the project does not do, grouped by theme |
+| [Architecture decisions](#architecture-decisions) | Eight ADRs, in `docs/adr/` |
 
 ## Architecture
 
@@ -33,8 +31,6 @@ flowchart LR
     Worker -->|claim, record result| DB
 ```
 
-The diagram and the bullets describe the design; the last bullet says what runs today.
-
 - The API only writes to PostgreSQL. A `202` response means the job is **saved**, not that it was
   published ([ADR 0002](docs/adr/0002-dual-write-strategy.md)).
 - Messages carry only the job ID. Workers read the job from PostgreSQL.
@@ -42,17 +38,28 @@ The diagram and the bullets describe the design; the last bullet says what runs 
   message cannot claim a job that is already claimed. Each claim holds a lease; jobs of crashed
   workers are recovered when the lease expires, and a stale worker's late result is rejected
   ([ADR 0001](docs/adr/0001-job-lifecycle.md)).
-- **Running today (phase 8):** the API, the dispatcher and the worker run as separate processes
-  (`make run`, `make dispatcher`, `make worker`), with the claim, the lease column, the fenced
-  final update, retries with exponential backoff and jitter, a row per attempt, a dead-letter
-  queue for messages the worker can never process, a list of failed jobs, idempotency keys for
-  submissions, and one notification per job however often its handler runs. Integration tests
-  take a job from `POST /jobs` through the dispatcher and a worker to `succeeded`, once at the
-  first attempt, once after two failed attempts, and once after three attempts that each reached
-  the provider (one notification), and a job that always fails to `failed` after its last attempt,
-  where the failed-jobs list shows it. The dispatcher also recovers jobs whose worker crashed and
-  jobs whose message was lost; both processes stop gracefully on a signal, wait for the database
-  and the broker at start, and survive broker outages (see [docs/operations.md](docs/operations.md)).
+- The three processes run separately (`make run`, `make dispatcher`, `make worker`). Integration
+  tests take jobs through all of them, and some failure-path tests run the dispatcher and the
+  workers as real processes that are killed, cut off from the broker or fed bad messages
+  ([failure modes](docs/failure-modes.md)).
+
+## Delivery guarantees
+
+In short ([full list, with tests](docs/delivery-guarantees.md)):
+
+- A `202` means the job is saved in PostgreSQL. It is published at least once while a dispatcher
+  runs and the broker is reachable. A crashed worker's job is recovered once its lease expires,
+  and a lost message once the jobs queue has no ready messages.
+- Delivery is at least once. A conditional claim lets each attempt be claimed once, and a fenced
+  final update rejects a stale worker's result. A handler can still run more than once for one
+  job.
+- A job is claimed at most `max_attempts` times, and every attempt is recorded. Only failures a
+  retry might fix are retried, with exponential backoff and full jitter (an expired lease is
+  retried at once).
+- `succeeded` and `failed` are final. Messages the worker cannot parse, and messages redelivered
+  past the delivery limit (20), go to a dead-letter queue.
+- Not guaranteed: exactly-once execution, that a failed job had no side effect, order, deadlines,
+  or that every job ends.
 
 ## MVP scope
 
@@ -89,7 +96,7 @@ The ADRs refer to these phases by number.
 7. Idempotency for submission and side effects *(done)*
 8. Graceful shutdown, stale-job and lost-message recovery, broker outages *(done)*
 9. Failure-path test suite *(done)*
-10. Documentation of delivery guarantees and operations
+10. Documentation of delivery guarantees and operations *(done)*
 
 ## Architecture decisions
 
@@ -267,3 +274,55 @@ make down                     # stop both; the data volumes are kept
 
 CI runs `make check` and the integration tests against PostgreSQL and RabbitMQ service containers
 on Python 3.12 and 3.14, and scans the full git history for secrets with gitleaks.
+
+## Try it
+
+With `make up` and `make db-migrate` done, start each process in a terminal of its own:
+`make run`, `make dispatcher` and `make worker`. Then, from a fourth:
+
+```bash
+curl -s -i -X POST http://127.0.0.1:8000/jobs -H 'Content-Type: application/json' \
+  -d '{"type": "notification.send", "payload_version": 1,
+       "payload": {"recipient": "max@example.com", "subject": "Hi", "body": "Hello"}}'
+```
+
+```http
+HTTP/1.1 202 Accepted
+location: /jobs/741c1437-9a8f-4490-8668-b4be15ff3a69
+
+{"id":"741c1437-9a8f-4490-8668-b4be15ff3a69","status":"queued"}
+```
+
+The job is saved, not yet run (other response headers are left out above). Read it back with its
+ID once the dispatcher's next poll (it pauses `DISPATCH_POLL_INTERVAL_S`, 1 s by default, between
+polls) has published it and the worker has run it:
+
+```bash
+id=741c1437-9a8f-4490-8668-b4be15ff3a69   # the ID from your response
+curl -s http://127.0.0.1:8000/jobs/$id
+curl -s http://127.0.0.1:8000/jobs/$id/attempts
+```
+
+```json
+{"id":"741c1437-…","type":"notification.send","payload_version":1,"status":"succeeded",
+ "attempts":1,"max_attempts":5,"available_at":"…","created_at":"…","updated_at":"…",
+ "result":{"provider":"fake","notification_id":"14903861-…"},"failure":null}
+{"attempts":[{"attempt":1,"started_at":"…","finished_at":"…","outcome":"succeeded","failure":null}]}
+```
+
+A payload that does not match the schema is refused and nothing is saved:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/jobs -H 'Content-Type: application/json' \
+  -d '{"type": "notification.send", "payload_version": 1, "payload": {"recipient": "max@example.com"}}'
+```
+
+```json
+{"error":{"code":"invalid_payload","message":"payload does not match the schema for this job type",
+ "details":["subject: missing","body: missing"]}}
+```
+
+The interactive API docs are at http://127.0.0.1:8000/docs. To see jobs wait for a worker, stop
+the worker, submit a job (it stays `queued`), then start the worker again. The failure paths and
+the tests that show them are in [docs/failure-modes.md](docs/failure-modes.md);
+`make test-integration` runs them.
