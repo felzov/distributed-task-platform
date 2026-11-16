@@ -246,6 +246,7 @@ uv run pre-commit install     # run lint, format, mypy and secret checks on ever
 cp .env.example .env          # then replace every change-me with a local password
 make up                       # start PostgreSQL (127.0.0.1:5432) and RabbitMQ (127.0.0.1:5672)
 make db-migrate               # apply migrations to the development database
+# The next three keep running: start each in its own terminal.
 make run                      # start the API on 127.0.0.1:8000 (docs at /docs)
 make dispatcher               # publish saved jobs to RabbitMQ until Ctrl-C
 make worker                   # run published jobs, one at a time, until Ctrl-C

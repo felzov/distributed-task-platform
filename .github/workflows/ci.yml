@@ -12,7 +12,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     # A hung test (e.g. a broker connect without its timeout) fails the run instead of using up
-    # GitHub's 6-hour default. A full run has taken well under a minute so far.
+    # GitHub's 6-hour default.
     timeout-minutes: 15
     strategy:
       fail-fast: false
