@@ -4,22 +4,20 @@ A background-job system built to make failure behaviour explicit: an HTTP API sa
 PostgreSQL, a dispatcher publishes them to RabbitMQ, and separate workers run them with bounded
 retries, so slow work stays out of the request path and every failure is recorded.
 
-> **Status: early development (phase 8 of 10).** So far there are the domain rules, a local
-> PostgreSQL with migrations for the `jobs` table (including the lease, error and result columns
-> the worker writes), the `job_attempts` table and the fake provider's `fake_notifications` table,
-> `POST /jobs` (validates and saves a job, safe to retry with an `Idempotency-Key`; 503 when the
-> database is unavailable), `GET /jobs/{id}`
-> (a job's state, result or failure, never its payload), `GET /jobs/{id}/attempts` (each recorded
-> attempt and how it ended), `GET /jobs?status=failed` (failed jobs, newest first), the `/health`
-> and `/ready` probes, a local RabbitMQ with the connection, queue, dead-letter queue and
-> confirmed-publish code, the dispatcher process that publishes saved jobs
-> to it, the worker process that claims each job, runs it against a fake notification provider
-> (one notification per job, however often its handler runs), records the result and retries the
-> handler's own failures with backoff, recovery of crashed workers' jobs and of lost messages,
-> graceful shutdown, waiting out outages at start and while running, and the development checks
-> (see Development setup).
-> Architecture says which parts of the design run today; MVP scope and the roadmap describe the
-> planned design; Known limitations covers both.
+> **Status: all ten planned phases are done.** A portfolio project that runs on one machine
+> with Docker Compose. It has not been used in production or load-tested, and it has no
+> authentication. It has one job type, `notification.send`, whose provider is a fake that records
+> each notification in PostgreSQL.
+
+## Documentation
+
+| Page | What it covers |
+|------|----------------|
+| [Delivery guarantees](docs/delivery-guarantees.md) | What a `202` means, what is and is not guaranteed, and the tests behind each promise |
+| [Failure modes](docs/failure-modes.md) | Each failure path (duplicates, crashes, retry exhaustion, bad input, outages, stuck jobs), what happens, and its tests |
+| [Operations](docs/operations.md) | Running, configuring, stopping and watching the processes; recovery, dead letters, logs, probes |
+| [Known limitations](docs/limitations.md) | Everything the project does not do, grouped by theme |
+| [Architecture decisions](#architecture-decisions) | Eight ADRs, in `docs/adr/` |
 
 ## Architecture
 
@@ -33,8 +31,6 @@ flowchart LR
     Worker -->|claim, record result| DB
 ```
 
-The diagram and the bullets describe the design; the last bullet says what runs today.
-
 - The API only writes to PostgreSQL. A `202` response means the job is **saved**, not that it was
   published ([ADR 0002](docs/adr/0002-dual-write-strategy.md)).
 - Messages carry only the job ID. Workers read the job from PostgreSQL.
@@ -42,17 +38,28 @@ The diagram and the bullets describe the design; the last bullet says what runs 
   message cannot claim a job that is already claimed. Each claim holds a lease; jobs of crashed
   workers are recovered when the lease expires, and a stale worker's late result is rejected
   ([ADR 0001](docs/adr/0001-job-lifecycle.md)).
-- **Running today (phase 8):** the API, the dispatcher and the worker run as separate processes
-  (`make run`, `make dispatcher`, `make worker`), with the claim, the lease column, the fenced
-  final update, retries with exponential backoff and jitter, a row per attempt, a dead-letter
-  queue for messages the worker can never process, a list of failed jobs, idempotency keys for
-  submissions, and one notification per job however often its handler runs. Integration tests
-  take a job from `POST /jobs` through the dispatcher and a worker to `succeeded`, once at the
-  first attempt, once after two failed attempts, and once after three attempts that each reached
-  the provider (one notification), and a job that always fails to `failed` after its last attempt,
-  where the failed-jobs list shows it. The dispatcher also recovers jobs whose worker crashed and
-  jobs whose message was lost; both processes stop gracefully on a signal, wait for the database
-  and the broker at start, and survive broker outages (see Recovery, shutdown and outages).
+- The three processes run separately (`make run`, `make dispatcher`, `make worker`). Integration
+  tests take jobs through all of them, and some failure-path tests run the dispatcher and the
+  workers as real processes that are killed, cut off from the broker or fed bad messages
+  ([failure modes](docs/failure-modes.md)).
+
+## Delivery guarantees
+
+In short ([full list, with tests](docs/delivery-guarantees.md)):
+
+- A `202` means the job is saved in PostgreSQL. It is published at least once while a dispatcher
+  runs and the broker is reachable. A crashed worker's job is recovered once its lease expires,
+  and a lost message once the jobs queue has no ready messages.
+- Delivery is at least once. A conditional claim lets each attempt be claimed once, and a fenced
+  final update rejects a stale worker's result. A handler can still run more than once for one
+  job.
+- A job is claimed at most `max_attempts` times, and every attempt is recorded. Only failures a
+  retry might fix are retried, with exponential backoff and full jitter (an expired lease is
+  retried at once).
+- `succeeded` and `failed` are final. Messages the worker cannot parse, and messages redelivered
+  past the delivery limit (20), go to a dead-letter queue.
+- Not guaranteed: exactly-once execution, that a failed job had no side effect, order, deadlines,
+  or that every job ends.
 
 ## MVP scope
 
@@ -89,7 +96,7 @@ The ADRs refer to these phases by number.
 7. Idempotency for submission and side effects *(done)*
 8. Graceful shutdown, stale-job and lost-message recovery, broker outages *(done)*
 9. Failure-path test suite *(done)*
-10. Documentation of delivery guarantees and operations
+10. Documentation of delivery guarantees and operations *(done)*
 
 ## Architecture decisions
 
@@ -183,7 +190,7 @@ that no longer passes validation fails the job at once: it would fail the same w
 
 `outcome` is `succeeded`, `failed`, or `null` while the attempt runs. The list is empty until the
 job is first claimed, and for a job that ran before migration 0003; an unknown job gets `404
-job_not_found`. The list need not start at attempt 1: see Known limitations.
+job_not_found`. The list need not start at attempt 1: see [docs/limitations.md](docs/limitations.md).
 
 ## Listing failed jobs
 
@@ -203,247 +210,30 @@ lists every failed job that existed when the walk began exactly once, even while
 cursor the API did not make gets `422 invalid_request`. Migration 0004 adds the index the list
 reads.
 
-## Dead letters
+## Operations
 
-A job that failed for good is its `failed` row in PostgreSQL, readable over the API. A **message**
-the worker can never process is kept on RabbitMQ instead of being dropped
-([ADR 0006](docs/adr/0006-dead-letters.md)). It goes to the dead-letter queue
-`<JOBS_QUEUE_NAME>.dead` (`jobs.dead` by default) when:
-
-- it cannot be parsed (the worker rejects it), with reason `rejected`;
-- it is returned to the queue more than 20 times (`x-delivery-limit`): requeued with `reject` after
-  a bug in its handling, or left unacknowledged when its worker dies, with reason `delivery_limit`.
-
-A database outage never sends a message there: the worker answers it with `nack`, which RabbitMQ
-does not count. Nothing reads the dead-letter queue and it never changes a job: a job whose message
-died is taken on by recovery instead (see Recovery, shutdown and outages), so a dead letter does
-not mean its job is stuck. To see how many messages it holds:
-
-```bash
-docker compose exec rabbitmq rabbitmqctl list_queues name messages
-```
-
-A message's body is `{"message_version": 1, "job_id": "…"}`, which names its job, and its
-`x-death` header says from which queue and why. The project has no tool to show a body yet.
-
-**Upgrading from phase 5.** The jobs queue's arguments are fixed when RabbitMQ creates it, so a
-`jobs` queue created by an earlier version makes the dispatcher and the worker stop at start with
-`PRECONDITION_FAILED`. Recreate it once: stop the dispatcher; let the workers empty the queue, then
-stop them (a running worker would declare a deleted queue again, with the old arguments); run
-`docker compose exec rabbitmq rabbitmqctl delete_queue jobs --if-empty --if-unused`; start the new
-version.
-
-## Recovery, shutdown and outages
-
-The dispatcher runs two recovery sweeps every `RECOVERY_INTERVAL_S` (30 s), next to its polls
-([ADR 0008](docs/adr/0008-recovery-and-shutdown.md)):
-
-- **Expired leases.** A job still `running` after its lease (`LEASE_DURATION_S`, 120 s) expired
-  belonged to a worker that crashed or was stopped too soon. With attempts left it goes back to
-  `queued`, due at once, without backoff; otherwise it fails. Either way its open attempt is closed
-  as `failed` with `lease_expired`, in the same transaction. A worker that finishes after the
-  sweep writes nothing: its result is rejected like any stale one.
-- **Lost messages.** A job `queued` and published more than `LOST_MESSAGE_AFTER_S` (600 s) ago
-  whose message never led to a claim (lost, dead-lettered, or rejected at the claim) is marked
-  unpublished, and the next poll publishes it again. The sweep runs only while the jobs queue has
-  no ready messages, so a message that is only waiting in a backlog is not published twice. While
-  the broker is unreachable it is skipped; the lease sweep needs only the database and still
-  runs.
-
-Both sweeps take at most `DISPATCH_BATCH_SIZE` jobs per pass with `FOR UPDATE SKIP LOCKED`, so
-several dispatchers can run them without recovering a job twice.
-
-**Stopping.** On SIGTERM or SIGINT (Ctrl-C):
-
-- the worker cancels its consumer, lets the job in hand finish and be acked for up to
-  `SHUTDOWN_GRACE_S` (30 s), and exits with status 0. Past that, the job is cancelled: its message
-  goes back to the queue and lease recovery takes the job on, which uses up the attempt;
-- the dispatcher lets the poll and the recovery pass in hand commit, starts no new ones, and exits
-  with status 0.
-
-A second signal stops either one within a few seconds: it cancels the work in hand (a dispatcher's
-open transaction rolls back, and its confirmed publishes are repeated on the next start), and each
-connection's close is bounded by `BROKER_CONNECT_TIMEOUT_S` and `DB_CONNECT_TIMEOUT_S`. Docker
-waits 10 s between SIGTERM and SIGKILL by default, less than the 30 s grace: give `docker stop` a
-longer `-t`.
-
-**Starting.** Both processes first check that the database is at exactly this code's migration
-revision, as `/ready` does, then connect to RabbitMQ:
-
-- a database that is unreachable, starting up or out of connections, and a broker that is
-  unreachable, are waited for: a warning, then another try every `STARTUP_RETRY_INTERVAL_S` (5 s)
-  until it works or a signal comes;
-- a configuration error stops the process with an ERROR and exit status 1: another migration
-  revision (both are named), a wrong password, an unknown database or vhost, a missing privilege,
-  a malformed URL.
-
-**While running.** The API never talks to RabbitMQ, so a broker outage never fails a submission:
-jobs wait in `queued` and are published once the broker is back. The dispatcher and the worker
-reconnect by themselves. If the worker's consumer ends or the broker fails it, the worker
-consumes again on a new channel every `STARTUP_RETRY_INTERVAL_S` until that works; only a queue
-the broker refuses to declare stops it. The tests cut and freeze connections through a small TCP
-proxy instead of stopping the shared containers.
-
-**Logs.** The dispatcher and the worker log one line per event to stderr, with time, level and
-logger, at `LOG_LEVEL` (`INFO` by default; `DEBUG`, `INFO` or `WARNING`). SQLAlchemy's
-engine stays at WARNING whatever the level, since at DEBUG it would log result rows, payloads
-included. Errors are logged by class and SQLSTATE, never their text. The API keeps uvicorn's
-logging.
-
-## Health and readiness probes
-
-- `GET /health` is liveness: it returns `200 {"status": "ok"}` whenever the process answers and
-  touches no dependency, so a liveness check on it never restarts the API because of a database
-  outage.
-- `GET /ready` returns `200 {"status": "ready"}` when PostgreSQL answers and its migration revision
-  is exactly the one this code expects. Otherwise it returns `503 service_unavailable` with
-  `details` naming the failed check, `["database"]` or `["migrations"]`, never an error text or a
-  revision id. The whole check is bounded by `READY_CHECK_TIMEOUT_S`.
-- `/ready` does **not** check RabbitMQ. The API never talks to the broker: it only saves jobs, and
-  a dispatcher publishes them (ADR 0002). An instance that can save jobs must keep accepting them
-  during a broker outage.
-- `/ready` takes its connection from the API's own pool, so it reports whether a request could get
-  a connection right now, not only whether PostgreSQL is up. A full pool therefore fails `/ready`
-  with `["database"]` even when PostgreSQL is fine, which takes a busy instance out of rotation.
+Running several workers, configuration, migrations, failed jobs and the dead-letter queue,
+recovery, stopping, outages, logs and the health and readiness probes are in
+[docs/operations.md](docs/operations.md).
 
 ## Known limitations
 
-- **No authentication.** Anyone who can reach the API can submit jobs, which means triggering
-  notifications, and anyone who knows a job ID can read that job's status. `GET /jobs?status=failed`
-  also lets anyone find the IDs, codes and times of failed jobs without knowing an ID first (never
-  their payloads). Run it only on a trusted network. The same goes for `/ready`: it tells anyone
-  who can reach it whether the database is at this code's migration revision.
-- A worker crash uses up one of the job's attempts, even when the crash had nothing to do with the
-  job (ADR 0001).
-- Dispatch latency is up to one dispatcher poll interval plus one poll (ADR 0002) while fewer than
-  `DISPATCH_BATCH_SIZE` jobs are due. The dispatcher pauses after every poll, even a full one, so
-  it publishes at most `DISPATCH_BATCH_SIZE` jobs per `DISPATCH_POLL_INTERVAL_S` (100 per second
-  with the defaults) and a backlog of N batches waits about N intervals. A database error during
-  a poll turns that poll's confirmed publishes into duplicates, which the worker's claim absorbs.
-- The dispatcher declares the jobs queue only when it starts. If the queue is deleted while it
-  runs, the broker returns every message and the jobs stay saved, unpublished, until a process
-  declares the queue again.
-- A second signal abandons the dispatcher's poll in progress: its transaction rolls back, and
-  publishes the broker had already confirmed become duplicates after the next start, which the
-  claim absorbs.
-- A retry runs the handler again. For `notification.send` that is safe: the handler gives the
-  provider the key `notification.send:{job_id}`, and the fake provider records one notification
-  per key, so every attempt of a job, current or stale, gets the same `notification_id` (ADR 0007).
-  This relies on the receiver deduplicating by key; a real provider usually forgets keys after a
-  retention window, which must outlast a job's retries and any outage. Two different jobs with the
-  same content still send twice.
-- Notifications recorded before migration 0006 have no key: a job that had attempts before it and
-  after it can have more than one row. A job that succeeded before phase 7 keeps its old result,
-  `{"provider": "fake"}`, without a `notification_id`.
-- Full jitter has no minimum wait, so a retry can be published almost at once. There is no
-  circuit breaker: while a provider is down, every job uses up all its attempts.
-- Attempt history starts with migration 0003. Jobs that ran before it have no attempt rows, and a
-  job that was running during the migration lists its attempts from the next one on.
-- An attempt whose worker crashed stays open (`finished_at` and `outcome` null) until lease
-  recovery closes it, up to the lease duration plus the recovery interval after the claim.
-- A claim the database rejects because of the job's own data (SQLSTATE class 22 or 23) is logged
-  at ERROR and its message acked (ADR 0004). Lost-message recovery publishes the job again once
-  per `LOST_MESSAGE_AFTER_S`, and the claim is rejected again each time: such a job never ends,
-  and logs an ERROR every round. The same holds for a message that is dead-lettered before every
-  claim, which also adds a copy to the dead-letter queue each round. There is no republish
-  counter.
-- A worker stopped past its grace period, or by a second signal, leaves its claimed job `running`
-  until lease recovery, and the job's notification may already have been sent, once (a later
-  attempt gets the same one).
-- When the final update fails with a database error, the message is requeued, but its redelivery
-  loses the claim: the job stays `running` until lease recovery, which uses up the attempt.
-- An unexpected error while handling a message (a bug) requeues it with `reject`, which counts:
-  past RabbitMQ's delivery limit (20) the message goes to the dead-letter queue, and a job that was
-  never claimed is published again by lost-message recovery.
-- Lost-message recovery waits while the jobs queue has ready messages, so under a backlog that
-  never drains, lost messages are never recovered. It cannot see messages a worker holds
-  unacknowledged: during a database outage it can publish an extra copy of a message that is only
-  held back, which the claim absorbs.
-- Migration 0004 builds its index with a plain `CREATE INDEX` inside Alembic's transaction, which
-  blocks writes to `jobs` while it runs (`CONCURRENTLY` cannot run in a transaction). Migrations
-  0005 and 0006 add columns and unique constraints (0005 also CHECKs, which scan `jobs`), and
-  these block reads too, of `jobs` and `fake_notifications`, until they commit (PostgreSQL
-  documentation). Fine for the table sizes here, but not measured.
-- The dead-letter queue grows without limit: nothing consumes or expires it, and clearing it
-  (purging the queue) is an operator's decision. If it is deleted while the system runs, a message
-  that dies meanwhile waits for it and shows up in neither queue's `messages` count until it is
-  declared again; RabbitMQ then moves it, about 3 minutes later in the one test (ADR 0006).
-- Start-up waits only for the first broker connection. If RabbitMQ goes away between that
-  connection and the queue declaration, the process exits with status 1 and a traceback, and must
-  be started again. A queue the broker refuses to declare (such as a `jobs` queue from before
-  phase 6) also stops it with a traceback.
-- A signal that arrives during the worker's subscribe (about a millisecond, at start and whenever
-  it consumes again) cancels the subscribe midway: one message comes back only when the
-  connection closes, counted towards the delivery limit.
-- A second signal stops a process within a bound, not at once: about 2 s when work in hand waits
-  on a database link that stopped answering (SQLAlchemy closes that connection with a 2 s timeout
-  no cancel cuts), and each later close gets its own bound (5 s each by default).
-- The schema check runs only at start. A migration applied while the processes run is not noticed
-  until they are restarted; with an older schema the worker's claim fails and it backs off, as
-  for a database outage.
-- Some library log lines are noisy or misleading. While the broker is unreachable at start, aiormq
-  logs an ERROR for each try and aio-pika an INFO "Reconnecting after 5 seconds", though the
-  process's own retry interval applies. When a stopping worker's job is acked before its consumer
-  cancel is answered, the cancel is dropped and aiormq logs a WARNING "Closing channel … because
-  RPC call Basic.Cancel cancelled" (harmless: a message delivered meanwhile goes back marked
-  redelivered, not counted). After a second signal, SQLAlchemy can log "Exception closing
-  connection" with a traceback of the cancelled close. When a test cut a running worker's broker
-  link, aiormq logged a WARNING "Cancelling cause reader exited abnormally" with a socket traceback
-  and aio-pika an `ERROR aio_pika.tools: Callback <… RobustChannel._on_close …> error:
-  RuntimeError: <Connection …> closed`. Both are harmless: the robust connection reconnects about
-  5 s later and restores its channel. They show the broker's user, host and port, with the
-  password masked (`docs/failure-modes.md`).
-- No constraint ties `result` and `error_code` to the status: `GET /jobs/{id}` derives both fields
-  from the status alone, and only the worker's own updates keep the columns consistent. A
-  `failed` row without an error code shows `failure: null`, and a code this version does not know
-  (e.g. one written by a newer worker) is shown with the message "the job failed". A `succeeded`
-  row whose result is missing or not a JSON object shows `result: null`. Each case is logged as a
-  warning, by job ID only.
-- `fake_notifications.job_id` has no index, so looking up a job's notifications (only tests do)
-  scans the table. That is fine for the fake provider; a real provider's records would need one.
-- A worker whose lease expired may still finish its handler. Its result is rejected, but its side
-  effect still happens; `notification.send` makes it the same notification as the current
-  attempt's. A future handler whose receiver takes no key needs a guard of its own (ADR 0007).
-- Recovering a crashed worker's job takes up to the lease duration plus the recovery interval
-  (150 s with the defaults), and its handler then runs again.
-- **A submission without an `Idempotency-Key` can be saved twice.** If the connection drops or
-  `DB_COMMAND_TIMEOUT_S` expires while PostgreSQL commits, the client gets 503 although the job
-  may have been saved, and the same happens to a client that never received its 202; a retry
-  without a key then creates a second job. A retry with the same key gets the saved job instead.
-- **Idempotency keys are global.** Without authentication there is one key space for everyone:
-  anyone who guesses a key and sends the same body gets that job's ID, a different body gets 422
-  (which shows the key is taken), and someone who learns a key before its owner uses it can take
-  it first. Random keys make guessing impractical.
-- Database and connection errors are logged as their class, SQLSTATE and constraint name only,
-  without a traceback, because PostgreSQL's error detail can quote the stored payload. Any
-  `OSError` is treated as "database unavailable" (503). Other unexpected errors return 500 and
-  uvicorn logs their full traceback for debugging, so a bug whose traceback holds request data
-  could still write it to the log.
-- The worker's claim reads the job's payload from PostgreSQL. The dispatcher's and the worker's
-  logging holds SQLAlchemy's `sqlalchemy.engine` logger at WARNING, since at DEBUG it logs result
-  rows, payloads included (`hide_parameters` hides only query parameters); a test runs both
-  processes at `LOG_LEVEL=DEBUG` and finds neither the payload nor a password in their logs. The
-  API keeps uvicorn's logging configuration, so the API's own INFO lines are not shown; its
-  warnings reach stderr without a timestamp.
-- uvicorn's access log records each request's raw path and query string, so job IDs, whatever a
-  client sent in place of one and anything after a `?` end up in the log. Payloads never do: they
-  travel only in request bodies.
-- When an integration test fails, pytest's report shows the test function's arguments (and, with
-  `--showlocals`, its locals). `TEST_DATABASE_URL`, `TEST_BROKER_URL` and the URLs the test
-  helpers derive from them show there as `<test URL, hidden>`, and the tests keep the processes'
-  output and environment out of the report. A failing comparison of a URL itself still prints
-  both values in pytest's diff. With `--showlocals`, a URL a test rebuilds as a plain string, or a
-  password it reads back (`get_secret_value()`, `urlsplit(url).password`), shows too. So the test
-  services should use throwaway passwords (CI's are written in its workflow file).
-- `/ready` requires the database revision to equal the code's exactly. During a rolling deploy,
-  instances running the old code report not ready as soon as the new migration is applied. The MVP
-  runs one instance and migrates before starting it.
-- Each failing `/ready` call logs one warning, so frequent probing during an outage produces many
-  identical lines. The database line includes pool usage (e.g. `pool 5/5 in use`), but under
-  traffic a slow database also fills the pool, so a full pool alone does not show the database is
-  healthy.
-- All limits and timeouts are placeholders, not measured values; `.env.example` lists every one
-  with its default (e.g. payload 64 KiB, statement timeout 5 s, client command timeout 10 s).
+The most important ones; all of them, grouped by theme, are in
+[docs/limitations.md](docs/limitations.md).
+
+- **No authentication.** Anyone who can reach the API can submit jobs and read any job whose ID
+  they know, and `GET /jobs?status=failed` lists the failed ones. Run it only on a trusted
+  network.
+- **A handler can run more than once for one job** (at-least-once delivery). Only
+  `notification.send` is safe to repeat, because the fake provider keeps one notification per key
+  `notification.send:{job_id}`; a real provider would have to keep keys long enough.
+- **A worker crash uses up one of the job's attempts**, even when the job was not at fault.
+- **A submission without an `Idempotency-Key` can be saved twice** if the connection drops or
+  `DB_COMMAND_TIMEOUT_S` expires while PostgreSQL commits, or the client never receives its `202`.
+- **Some jobs never end.** A job whose claim the database rejects for its own data, or whose
+  message is dead-lettered before every claim, is published again every `LOST_MESSAGE_AFTER_S`.
+- **Nothing is measured.** All limits and timeouts are placeholders, and nothing has been
+  benchmarked.
 
 ## Development setup
 
@@ -456,6 +246,7 @@ uv run pre-commit install     # run lint, format, mypy and secret checks on ever
 cp .env.example .env          # then replace every change-me with a local password
 make up                       # start PostgreSQL (127.0.0.1:5432) and RabbitMQ (127.0.0.1:5672)
 make db-migrate               # apply migrations to the development database
+# The next three keep running: start each in its own terminal.
 make run                      # start the API on 127.0.0.1:8000 (docs at /docs)
 make dispatcher               # publish saved jobs to RabbitMQ until Ctrl-C
 make worker                   # run published jobs, one at a time, until Ctrl-C
@@ -476,18 +267,63 @@ make down                     # stop both; the data volumes are kept
   queues with unique names and delete only those and their `.dead` queues, so they can share the
   local RabbitMQ.
 - The dispatcher and the worker exit with status 1 at start if the development database is not
-  at this code's migration revision (run `make db-migrate`), and wait while PostgreSQL or RabbitMQ
-  is unreachable (see Recovery, shutdown and outages). Ctrl-C stops them gracefully; a second
-  Ctrl-C stops them within a few seconds.
-- A running dispatcher logs each poll that found due jobs, with how many it published, and each
-  job it recovered; a database outage only fails polls and sweeps, and the next one tries again.
-- While the database is down the worker gives each message back (`nack`) after
-  `WORKER_DB_ERROR_BACKOFF_S`, so no message is lost; its warnings name the job ID and error
-  class, never the payload. The worker stops at start if the queue cannot be declared, for example
-  a `jobs` queue from before phase 6 (see Dead letters, "Upgrading from phase 5"). Several workers
-  can run at once: the claim lets only one of them run a job.
+  at this code's migration revision (run `make db-migrate`). Ctrl-C stops them gracefully; a
+  second Ctrl-C stops them within a few seconds. Several workers can run at once. How they start,
+  stop, recover and log: [docs/operations.md](docs/operations.md).
 - Migrations are written by hand, never autogenerated:
   `make db-revision id=0002 m="what it does"` creates an empty revision to fill in.
 
 CI runs `make check` and the integration tests against PostgreSQL and RabbitMQ service containers
 on Python 3.12 and 3.14, and scans the full git history for secrets with gitleaks.
+
+## Try it
+
+With `make up` and `make db-migrate` done, start each process in a terminal of its own:
+`make run`, `make dispatcher` and `make worker`. Then, from a fourth:
+
+```bash
+curl -s -i -X POST http://127.0.0.1:8000/jobs -H 'Content-Type: application/json' \
+  -d '{"type": "notification.send", "payload_version": 1,
+       "payload": {"recipient": "max@example.com", "subject": "Hi", "body": "Hello"}}'
+```
+
+```http
+HTTP/1.1 202 Accepted
+location: /jobs/741c1437-9a8f-4490-8668-b4be15ff3a69
+
+{"id":"741c1437-9a8f-4490-8668-b4be15ff3a69","status":"queued"}
+```
+
+The job is saved, not yet run (other response headers are left out above). Read it back with its
+ID once the dispatcher's next poll (it pauses `DISPATCH_POLL_INTERVAL_S`, 1 s by default, between
+polls) has published it and the worker has run it:
+
+```bash
+id=741c1437-9a8f-4490-8668-b4be15ff3a69   # the ID from your response
+curl -s http://127.0.0.1:8000/jobs/$id
+curl -s http://127.0.0.1:8000/jobs/$id/attempts
+```
+
+```json
+{"id":"741c1437-…","type":"notification.send","payload_version":1,"status":"succeeded",
+ "attempts":1,"max_attempts":5,"available_at":"…","created_at":"…","updated_at":"…",
+ "result":{"provider":"fake","notification_id":"14903861-…"},"failure":null}
+{"attempts":[{"attempt":1,"started_at":"…","finished_at":"…","outcome":"succeeded","failure":null}]}
+```
+
+A payload that does not match the schema is refused and nothing is saved:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/jobs -H 'Content-Type: application/json' \
+  -d '{"type": "notification.send", "payload_version": 1, "payload": {"recipient": "max@example.com"}}'
+```
+
+```json
+{"error":{"code":"invalid_payload","message":"payload does not match the schema for this job type",
+ "details":["subject: missing","body: missing"]}}
+```
+
+The interactive API docs are at http://127.0.0.1:8000/docs. To see jobs wait for a worker, stop
+the worker, submit a job (it stays `queued`), then start the worker again. The failure paths and
+the tests that show them are in [docs/failure-modes.md](docs/failure-modes.md);
+`make test-integration` runs them.
